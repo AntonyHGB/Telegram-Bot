@@ -39,10 +39,9 @@ def time(update, context):
 def coin(update, context):
     with urllib.request.urlopen("https://economia.awesomeapi.com.br/last/BTC-BRL") as url:
         data = json.loads(url.read().decode())
-        #data_max = data['high']
-        #print(contatos['Ana'])
-        #x = data['high']
-        update.message.reply_text(f'texto : {data["high"]}')
+        coin = data['BTCBRL']["name"]
+        value_coin = data['BTCBRL']["high"]
+        update.message.reply_text(f"Coins = {coin} | Value = {value_coin}")
 
 def echo(update, context):
     update.message.reply_text(update.message.text)
@@ -53,7 +52,7 @@ def error(update, context):
 
 
 def main():
-    updater = Updater("1691021481:AAGAj779JAN77DE422eimpoERD14JuykAHg", use_context=True)
+    updater = Updater("Token", use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
