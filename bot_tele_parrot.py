@@ -1,7 +1,9 @@
 import logging
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, InlineQueryHandler
 from datetime import datetime
 import urllib.request, json
+import requests
+import re
 
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -39,9 +41,8 @@ def coin(update, context):
         data = json.loads(url.read().decode())
         #data_max = data['high']
         #print(contatos['Ana'])
-        x = print(data['high'])
-        update.message.reply_text(f'texto : {x}')
-
+        #x = data['high']
+        update.message.reply_text(f'texto : {data["high"]}')
 
 def echo(update, context):
     update.message.reply_text(update.message.text)
@@ -52,7 +53,7 @@ def error(update, context):
 
 
 def main():
-    updater = Updater("token", use_context=True)
+    updater = Updater("1691021481:AAGAj779JAN77DE422eimpoERD14JuykAHg", use_context=True)
     dp = updater.dispatcher
 
     dp.add_handler(CommandHandler("start", start))
