@@ -19,12 +19,15 @@ def help(update, context):
 
 
 def commands(update, context):
-    update.message.reply_text('/start will say Hello World to you')
-    update.message.reply_text('/help will not help you')
-    update.message.reply_text('/commands you already understand')
-    update.message.reply_text('/time will show the hour to you')
-    update.message.reply_text('/coin will show BTC in Real')
-    update.message.reply_text('/end will say bye bye to you')
+    update.message.reply_text(f'''
+    /start will say Hello World to you \n
+    /help will not help you \n
+    /commands you already understand \n
+    /time will show the hour to you \n
+    /coin will show BTC in Real \n
+    /cep will show more information about your cep \n
+    /insult will insult you \n
+    /end will say bye bye to you \n ''')
 
 
 def end(update, context):
@@ -33,7 +36,7 @@ def end(update, context):
 
 def time(update, context):
     tempo = datetime.now().strftime('%d-%m-%Y %H:%M:%S')
-    update.message.reply_text(f'Dia e hora atual: \n{tempo}')
+    update.message.reply_text(f'Day and hour: \n{tempo}')
 
 
 def coin(update, context):
@@ -41,7 +44,24 @@ def coin(update, context):
         data = json.loads(url.read().decode())
         coin = data['BTCBRL']["name"]
         value_coin = data['BTCBRL']["high"]
-        update.message.reply_text(f"Coins = {coin} | Value = {value_coin}")
+        update.message.reply_text(f"Coins = {coin} \n Max Value in past 24 hours= {value_coin}")
+
+def cep(update, context):
+    with urllib.request.urlopen("https://cep.awesomeapi.com.br/json/13313129") as url:
+        data = json.loads(url.read().decode())
+        numbers_cep = data["cep"]
+        address = data["address"]
+        state = data["state"]
+        district = data["district"]
+        city = data["city"]
+        ddd = data["ddd"]
+        update.message.reply_text(f'''CEP = {numbers_cep} \n Address = {address} \n State = {state}\n District = {district}\n City = {city}\n DDD = {ddd}\n''')
+
+def insult(update, context):
+    with urllib.request.urlopen("https://evilinsult.com/generate_insult.php?lang=en&type=json") as url:
+        data = json.loads(url.read().decode())
+        sentence = data["insult"]
+        update.message.reply_text(f"Insult: \n{sentence}")
 
 def echo(update, context):
     update.message.reply_text(update.message.text)
@@ -61,6 +81,8 @@ def main():
     dp.add_handler(CommandHandler("end", end))
     dp.add_handler(CommandHandler("time", time))
     dp.add_handler(CommandHandler("coin", coin))
+    dp.add_handler(CommandHandler("cep", cep))
+    dp.add_handler(CommandHandler("insult", insult))
 
     dp.add_handler(MessageHandler(Filters.text, echo))
     dp.add_error_handler(error)
