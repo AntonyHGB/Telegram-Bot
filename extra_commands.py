@@ -13,21 +13,25 @@ from integrations import NotionConfigurationError, create_task, speech
 
 GUIDE = """O que posso fazer por você
 
-IA local
+Tudo que usa IA, suas notas, voz ou tarefas exige acesso liberado
+(ALLOWED_USER_IDS). Use /meuid para pegar seu ID e pedir ao dono do bot.
+
+IA local (restrito)
 /ask explique listas em Python — conversar com a IA
+/estudo o que é modelagem dimensional? — consultar o tutor de estudos
 /traduzir inglês Bom dia — traduzir um texto
 Envie uma mensagem de voz — receber a transcrição (até 2 minutos)
 /reset — apagar seu histórico e resumo da conversa
 
-Organização
+Organização (restrito)
 /lembrete 10m tomar água — agendar um aviso
 /tarefa Revisar currículo — criar uma tarefa no Notion configurado
 
-Suas notas (acesso restrito, conversa privada)
+Suas notas (restrito, conversa privada)
 /nota o que anotei sobre estudos? — consultar o vault
 /resumo — pedir um resumo das notas de diário
 
-Consultas
+Consultas (públicas)
 /coin USD EUR BTC — cotações, com botão Atualizar
 /cep 01310100 — endereço de um CEP
 /clima São Paulo — temperatura e condições atuais
@@ -35,12 +39,12 @@ Consultas
 
 Ajuda
 /guia — este resumo
-/meuid — seu ID para configurar o acesso
-/status — verificar os serviços
+/meuid — seu ID para pedir acesso
+/status — verificar os serviços (restrito)
 /commands — lista de comandos
 /insult — comando de humor com conteúdo externo
 
-Voz e Notion exigem usuário autorizado. /tarefa precisa da integração configurada.
+/tarefa precisa da integração do Notion configurada.
 A IA pode errar: confira informações importantes e fontes citadas."""
 
 

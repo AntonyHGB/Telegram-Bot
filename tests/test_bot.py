@@ -341,7 +341,7 @@ def test_commands_lists_ai_commands():
     update, context = FakeUpdate(), FakeContext()
     run(bot.commands(update, context))
     text = update.message.texts[0]
-    for command in ("/cep <codigo>", "/ask <question>", "/nota <question>", "/lembrete", "/status"):
+    for command in ("/cep <codigo>", "/ask <question>", "/nota <question>", "/estudo <question>", "/lembrete", "/status"):
         assert command in text
 
 
@@ -507,6 +507,30 @@ def test_ask_rate_limit(history, monkeypatch):
     assert history.recent(42) == []
 
 
+def test_ask_requires_allowed_user(history, monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
+    monkeypatch.setattr(bot, "stream_chat", fake_stream(["nao deveria rodar"]))
+    update, context = FakeUpdate(), FakeContext(["oi"])
+    run(bot.ask(update, context))
+    assert "restrito" in update.message.texts[0].lower()
+    assert history.recent(42) == []
+
+
+def test_status_requires_allowed_user(monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
+    update = FakeUpdate()
+    run(bot.status(update, FakeContext()))
+    assert "restrito" in update.message.texts[0].lower()
+
+
+def test_lembrete_requires_allowed_user(reminders, monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
+    update = FakeUpdate()
+    run(bot.lembrete(update, FakeContext(["10m", "tomar", "agua"])))
+    assert "restrito" in update.message.texts[0].lower()
+    assert reminders.pending() == []
+
+
 def test_nota_disabled_without_allowed_ids(history, monkeypatch):
     monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
     update, context = FakeUpdate(), FakeContext(["pergunta"])
@@ -529,6 +553,32 @@ def test_nota_uses_vault_proxy(history, monkeypatch):
     run(bot.nota(update, context))
     assert captured["base_url"] == bot.VAULT_PROXY_URL
     assert "vault" in update.message.texts[-1]
+
+
+def test_estudo_without_question_returns_usage(history):
+    update, context = FakeUpdate(), FakeContext()
+    run(bot.estudo(update, context))
+    assert "Usage" in update.message.texts[0]
+
+
+def test_estudo_requires_allowed_user(history, monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
+    monkeypatch.setattr(bot, "stream_chat", fake_stream(["nao deveria rodar"]))
+    update, context = FakeUpdate(), FakeContext(["Explique", "modelagem", "dimensional"])
+    run(bot.estudo(update, context))
+    assert "restrito" in update.message.texts[0].lower()
+    assert history.recent(42) == []
+
+
+def test_estudo_uses_estudos_proxy(history, monkeypatch):
+    captured = {}
+    monkeypatch.setattr(bot, "stream_chat", fake_stream(["Star schema..."], captured))
+    update, context = FakeUpdate(), FakeContext(["O", "que", "e", "star", "schema?"])
+    run(bot.estudo(update, context))
+    assert captured["base_url"] == bot.ESTUDOS_PROXY_URL
+    stored = history.recent(42)
+    assert [item["role"] for item in stored] == ["user", "assistant"]
+    assert stored[0]["content"] == "O que e star schema?"
 
 
 def test_resumo_uses_vault(history, monkeypatch):
@@ -611,6 +661,7 @@ def test_build_application_registers_handlers():
     expected = {
         "ask",
         "nota",
+        "estudo",
         "resumo",
         "reset",
         "coin",

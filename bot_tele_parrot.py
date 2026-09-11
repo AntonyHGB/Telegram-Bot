@@ -53,11 +53,16 @@ WEATHER_URL = (
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 VAULT_PROXY_URL = os.environ.get("VAULT_PROXY_URL", "http://127.0.0.1:11435")
+ESTUDOS_PROXY_URL = os.environ.get("ESTUDOS_PROXY_URL", "http://127.0.0.1:11436")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_history.db")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
 
-SYSTEM_PROMPT = "You are a helpful assistant. Answer in Brazilian Portuguese, concisely."
+SYSTEM_PROMPT = (
+    "You are a helpful assistant. Answer in Brazilian Portuguese, concisely. "
+    "You have no access to this Telegram bot's configuration, access rules or source code; "
+    "if asked about them, say you cannot see that and point to /guia."
+)
 RESUMO_QUESTION = (
     "Resuma o que esta registrado nas notas de diario mais recentes do vault: "
     "o que foi feito, o que ficou pendente e prioridades. Use topicos curtos."
@@ -99,11 +104,12 @@ BOT_COMMANDS = [
     BotCommand("cep", "Consulta um CEP"),
     BotCommand("clima", "Clima de uma cidade"),
     BotCommand("insult", "Um insulto aleatorio"),
-    BotCommand("ask", "Pergunta para a IA local"),
+    BotCommand("ask", "Pergunta para a IA local (restrito)"),
+    BotCommand("estudo", "Consulta o tutor de estudos (restrito)"),
     BotCommand("nota", "Consulta o vault (restrito)"),
     BotCommand("resumo", "Resumo do diario (restrito)"),
-    BotCommand("lembrete", "Cria um lembrete"),
-    BotCommand("status", "Status dos servicos"),
+    BotCommand("lembrete", "Cria um lembrete (restrito)"),
+    BotCommand("status", "Status dos servicos (restrito)"),
     BotCommand("reset", "Limpa o historico"),
     BotCommand("end", "Despedida"),
 ]
@@ -112,7 +118,7 @@ COMMANDS_TEXT = (
     "/start will say Hello World to you\n"
     "/help e /guia mostram recursos e exemplos\n"
     "/meuid mostra seu ID\n"
-    "/traduzir ingles Bom dia traduz um texto\n"
+    "/traduzir ingles Bom dia traduz um texto (restrito)\n"
     "/tarefa <titulo> cria uma tarefa no Notion (restrito)\n"
     "Envie uma mensagem de voz para transcrever (restrito)\n"
     "/commands you already understand\n"
@@ -121,11 +127,12 @@ COMMANDS_TEXT = (
     "/cep <codigo> will show more information about your cep\n"
     "/clima <cidade> will show the weather\n"
     "/insult will insult you\n"
-    "/ask <question> asks the local AI (Ollama)\n"
+    "/ask <question> asks the local AI (restricted)\n"
+    "/estudo <question> asks using the study material (restricted)\n"
     "/nota <question> asks using your Obsidian vault (restricted)\n"
     "/resumo summarizes the latest diary notes (restricted)\n"
-    "/lembrete <10m> <texto> creates a reminder\n"
-    "/status shows Ollama, vault and history status\n"
+    "/lembrete <10m> <texto> creates a reminder (restricted)\n"
+    "/status shows Ollama, vault and history status (restricted)\n"
     "/reset clears your conversation history\n"
     "/end will say bye bye to you"
 )
@@ -514,6 +521,21 @@ def vault_allowed(update):
     return True, ""
 
 
+def is_allowed(update):
+    user_id = get_user_id(update)
+    return bool(ALLOWED_USER_IDS) and user_id is not None and user_id in ALLOWED_USER_IDS
+
+
+async def require_allowed(update):
+    if is_allowed(update):
+        return True
+    await update.message.reply_text(
+        "Acesso restrito. Envie /meuid e peça para o dono do bot liberar seu ID "
+        "(ALLOWED_USER_IDS)."
+    )
+    return False
+
+
 async def answer_with_llm(update, question, base_url, error_text):
     if update.effective_chat.type != "private":
         await update.message.reply_text("Use a conversa privada para manter seu histórico reservado.")
@@ -664,6 +686,8 @@ async def insult(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
     question = " ".join(context.args or []).strip()
     if not question:
         await update.message.reply_text("Usage: /ask <question>")
@@ -687,6 +711,21 @@ async def nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def estudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
+    question = " ".join(context.args or []).strip()
+    if not question:
+        await update.message.reply_text("Usage: /estudo <question>")
+        return
+    await answer_with_llm(
+        update,
+        question,
+        ESTUDOS_PROXY_URL,
+        "Could not reach the study tutor right now. Try again later.",
+    )
+
+
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed, reason = vault_allowed(update)
     if not allowed:
@@ -701,6 +740,8 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
     seconds = parse_duration(context.args[0]) if context.args else None
     text = " ".join(context.args[1:]).strip() if context.args else ""
     if not seconds or not text:
@@ -733,6 +774,8 @@ def reschedule_reminders(application):
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
     info = await service_status()
     user_id = get_user_id(update)
     history_count = HISTORY.count(user_id) if user_id is not None else 0
@@ -796,6 +839,7 @@ def build_application(token):
     application.add_handler(CommandHandler("insult", insult))
     application.add_handler(CommandHandler("ask", ask))
     application.add_handler(CommandHandler("nota", nota))
+    application.add_handler(CommandHandler("estudo", estudo))
     application.add_handler(CommandHandler("resumo", resumo))
     application.add_handler(CommandHandler("lembrete", lembrete))
     application.add_handler(CommandHandler("status", status))

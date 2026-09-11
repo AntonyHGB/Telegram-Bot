@@ -3,9 +3,10 @@
 Bot experimental para Telegram, criado para aprender `python-telegram-bot`. Responde a
 comandos, consulta APIs públicas simples (moedas, CEP e clima), transcreve mensagens de
 voz em CPU e usa a IA local (Ollama) para responder perguntas, guardando o histórico em
-SQLite. Os comandos de notas (`/nota`, `/resumo`) e de voz/tarefa são restritos; as notas
-vêm do vault Obsidian via `vault-proxy` da ai-stack e as tarefas vão para um Notion
-configurado pelo próprio bot.
+SQLite. Tudo que usa IA ou dados pessoais (incluindo `/estudo`, `/nota`, `/resumo`, voz e
+`/tarefa`) é **fechado por padrão**: só funciona para IDs em `ALLOWED_USER_IDS`. As notas
+vêm do vault Obsidian via `vault-proxy`, o material de estudos do `estudos-proxy` e as
+tarefas vão para um Notion configurado pelo próprio bot.
 
 ## Requisitos
 
@@ -13,6 +14,7 @@ configurado pelo próprio bot.
 - Um token do [@BotFather](https://t.me/BotFather)
 - Para `/ask`: Ollama local (padrão `qwen2.5:3b`)
 - Para `/nota` e `/resumo`: ai-stack no ar com o `vault-proxy`
+- Para `/estudo`: ai-stack no ar com o `estudos-proxy`
 - Para voz: `requirements-audio.txt` (`faster-whisper`, roda em CPU)
 - Para `/tarefa`: integração interna do Notion com acesso à base escolhida
 
@@ -39,10 +41,11 @@ Variáveis reconhecidas:
 | Variável | Padrão | Uso |
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | obrigatória para rodar |
-| `ALLOWED_USER_IDS` | vazio | IDs autorizados em `/nota`, `/resumo`, `/tarefa` e voz; vazio desabilita |
+| `ALLOWED_USER_IDS` | vazio | lista de IDs autorizados em `/ask`, `/estudo`, `/nota`, `/resumo`, `/status`, `/lembrete`, `/tarefa` e voz; vazio desabilita esses comandos |
 | `OLLAMA_URL` | `http://127.0.0.1:11434` | endpoint do Ollama para `/ask` |
 | `OLLAMA_MODEL` | `qwen2.5:3b` | modelo usado em `/ask`, `/nota` e `/traduzir` |
 | `VAULT_PROXY_URL` | `http://127.0.0.1:11435` | proxy do vault para `/nota` e `/resumo` |
+| `ESTUDOS_PROXY_URL` | `http://127.0.0.1:11436` | proxy do tutor de estudos para `/estudo` |
 | `BOT_DB_PATH` | `bot_history.db` | banco SQLite do histórico e lembretes |
 | `RATE_LIMIT_PER_MINUTE` | `5` | limite de perguntas/minuto na IA, `/tarefa` e voz |
 | `NOTION_TOKEN` | vazio | credencial da integração interna do Notion |
@@ -74,13 +77,14 @@ Se `TELEGRAM_BOT_TOKEN` não estiver definido, o programa encerra com uma mensag
 | `/cep <codigo>` | Endereço do CEP, ex.: `/cep 01310100` |
 | `/clima <cidade>` | Clima atual via Open-Meteo, ex.: `/clima Sao Paulo` |
 | `/insult` | Insulto aleatório (evilinsult.com) |
-| `/ask <pergunta>` | IA local com streaming e contexto |
-| `/traduzir <idioma> <texto>` | Tradução pela IA local, ex.: `/traduzir inglês Bom dia` |
+| `/ask <pergunta>` | IA local com streaming e contexto (restrito) |
+| `/traduzir <idioma> <texto>` | Tradução pela IA local, ex.: `/traduzir inglês Bom dia` (restrito) |
 | `/nota <pergunta>` | Responde usando as notas do vault Obsidian (restrito) |
+| `/estudo <pergunta>` | Responde usando o material de estudos (restrito) |
 | `/resumo` | Resume as notas de diário mais recentes do vault (restrito) |
-| `/lembrete 10m texto` | Agenda um lembrete (`s`/`m`/`h`/`d`), persistido em SQLite |
+| `/lembrete 10m texto` | Agenda um lembrete (`s`/`m`/`h`/`d`), persistido em SQLite (restrito) |
 | `/tarefa <titulo>` | Cria uma página no Notion configurado (restrito) |
-| `/status` | Mostra Ollama, modelo, vault, histórico, lembretes e uptime |
+| `/status` | Mostra Ollama, modelo, vault, histórico, lembretes e uptime (restrito) |
 | `/reset` | Limpa o histórico de conversa do usuário |
 | `/end` | Despedida |
 | *(mensagem de voz)* | Transcreve o áudio em CPU (restrito, até 2 min/10 MB) |
@@ -90,6 +94,17 @@ quando o bot é mencionado. O menu nativo do Telegram é registrado via `set_my_
 Comandos que usam histórico (IA, notas e voz) só funcionam em conversa privada, para não
 expor seu histórico em grupos.
 
+## Controle de acesso
+
+O bot adota **fail-closed**: sem `ALLOWED_USER_IDS` configurado, os comandos de IA, dados
+e automações ficam desabilitados (respondem "Acesso restrito"). Públicos ficam apenas os
+comandos sem dados pessoais e sem custo de GPU: `/start`, `/guia`, `/help`, `/meuid`,
+`/commands`, `/time`, `/coin`, `/cep`, `/clima`, `/insult`, `/reset` (só o próprio
+histórico) e o eco em conversa privada.
+
+Para liberar alguém: a pessoa envia `/meuid`, o ID entra em `ALLOWED_USER_IDS` (separado
+por vírgula) e o bot é reiniciado. O rate limit continua valendo por usuário.
+
 ## IA local e vault
 
 `/ask` chama `POST {OLLAMA_URL}/api/chat` com streaming: a resposta é editada conforme
@@ -98,9 +113,11 @@ as mais antigas são resumidas pelo próprio modelo e substituídas por um resum
 `/reset` apaga tudo. Cada resposta traz um botão "Limpar historico".
 
 `/nota` e `/resumo` chamam `{VAULT_PROXY_URL}/api/chat`, que injeta trechos do vault e
-devolve a lista de notas consultadas. Como são dados privados, só funcionam para IDs
-em `ALLOWED_USER_IDS`; sem essa variável ficam desabilitados. As perguntas de IA têm
-limite de `RATE_LIMIT_PER_MINUTE` por usuário para proteger a GPU local.
+devolve a lista de notas consultadas. `/estudo` usa o mesmo caminho em
+`{ESTUDOS_PROXY_URL}/api/chat` sobre o corpus de estudos. **Todos são restritos** por
+`ALLOWED_USER_IDS` (fail-closed), assim como `/ask`, `/status` e `/lembrete`; o corpus
+de estudos não é exposto a usuários não autorizados. As perguntas de IA têm limite de
+`RATE_LIMIT_PER_MINUTE` por usuário para proteger a GPU local.
 
 `/lembrete` usa o `JobQueue` do PTB e uma tabela `reminders` no SQLite: lembretes
 pendentes são reagendados automaticamente quando o bot reinicia.
@@ -143,8 +160,9 @@ docker compose --profile bot up -d --build telegram-bot
 docker compose logs -f telegram-bot
 ```
 
-Na rede da stack o bot usa `OLLAMA_URL=http://ollama:11434` e
-`VAULT_PROXY_URL=http://vault-proxy:11434`; o banco e o cache de voz ficam no volume
+Na rede da stack o bot usa `OLLAMA_URL=http://ollama:11434`,
+`VAULT_PROXY_URL=http://vault-proxy:11434` e
+`ESTUDOS_PROXY_URL=http://estudos-proxy:11434`; o banco e o cache de voz ficam no volume
 `bot_data`. A imagem já inclui o `faster-whisper` via `requirements-audio.txt`.
 
 Se a ai-stack não for editada, o arquivo `compose.bot.yaml` deste repositório adiciona
@@ -164,7 +182,7 @@ pytest
 ruff check .
 ```
 
-Os testes (60) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
+Os testes (66) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
 histórico SQLite, sumarização, lembretes, autorização, rate limit, echo em grupo,
 transcrição de voz (com mock), criação de tarefa no Notion (com `httpx.MockTransport`)
 e o registro dos handlers, sem rede nem token real.
@@ -197,3 +215,7 @@ Em 2026-09-11 ganhou streaming, lembretes persistentes, `/clima`, `/resumo`, `/s
 menu nativo, botões inline, rate limit e resumo automático do histórico.
 Em 2026-09-11 (fase 2) ganhou transcrição de voz local, `/tarefa` no Notion, `/guia`,
 `/meuid` e `/traduzir`.
+Em 2026-09-11 (fase 3) ganhou `/estudo`, o tutor de estudos servido pelo `estudos-proxy`
+da ai-stack, e o acesso ficou **fail-closed**: todos os comandos de IA/dados
+(`/ask`, `/estudo`, `/nota`, `/resumo`, `/status`, `/lembrete`, voz e `/tarefa`) exigem
+`ALLOWED_USER_IDS`, e o prompt do modelo não finge conhecer a configuração do bot.
