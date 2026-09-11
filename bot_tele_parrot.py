@@ -1,39 +1,111 @@
+import json
 import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import closing
 from datetime import datetime
+from urllib.parse import quote
 
 import httpx
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import InvalidToken, TelegramError
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 TOKEN_ENV = "TELEGRAM_BOT_TOKEN"
 HTTP_TIMEOUT = 10.0
 LLM_TIMEOUT = 120.0
 HISTORY_LIMIT = 8
+HISTORY_THRESHOLD = 24
 REPLY_LIMIT = 4000
+EDIT_INTERVAL = 1.5
+REMINDER_MAX_SECONDS = 30 * 24 * 3600
+START_TIME = time.monotonic()
 
 COIN_URL = "https://economia.awesomeapi.com.br/last/{pairs}"
 DEFAULT_COINS = ("USD-BRL", "EUR-BRL", "BTC-BRL")
 CEP_URL = "https://cep.awesomeapi.com.br/json/{cep}"
 INSULT_URL = "https://evilinsult.com/generate_insult.php?lang=en&type=json"
+GEO_URL = (
+    "https://geocoding-api.open-meteo.com/v1/search?name={city}&count=1&language=pt&format=json"
+)
+WEATHER_URL = (
+    "https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}"
+    "&current=temperature_2m,apparent_temperature,weather_code&timezone=auto"
+)
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 VAULT_PROXY_URL = os.environ.get("VAULT_PROXY_URL", "http://127.0.0.1:11435")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_history.db")
+RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
 
 SYSTEM_PROMPT = "You are a helpful assistant. Answer in Brazilian Portuguese, concisely."
+RESUMO_QUESTION = (
+    "Resuma o que esta registrado nas notas de diario mais recentes do vault: "
+    "o que foi feito, o que ficou pendente e prioridades. Use topicos curtos."
+)
 
 PAIR_RE = re.compile(r"^[A-Z]{3}-[A-Z]{3}$")
+DURATION_RE = re.compile(r"^(\d{1,3})([smhd])$")
+
+WEATHER_CODES = {
+    0: "Ceu limpo",
+    1: "Predominancia de sol",
+    2: "Parcialmente nublado",
+    3: "Nublado",
+    45: "Nevoeiro",
+    48: "Nevoeiro com geada",
+    51: "Garoa leve",
+    53: "Garoa",
+    55: "Garoa forte",
+    61: "Chuva leve",
+    63: "Chuva",
+    65: "Chuva forte",
+    71: "Neve leve",
+    73: "Neve",
+    75: "Neve forte",
+    80: "Pancadas de chuva leves",
+    81: "Pancadas de chuva",
+    82: "Pancadas de chuva fortes",
+    95: "Trovoada",
+    96: "Trovoada com granizo",
+    99: "Trovoada forte",
+}
+
+BOT_COMMANDS = [
+    BotCommand("start", "Diz Hello World"),
+    BotCommand("help", "Nao ajuda em nada"),
+    BotCommand("commands", "Lista os comandos"),
+    BotCommand("time", "Data e hora atuais"),
+    BotCommand("coin", "Cotacoes em BRL"),
+    BotCommand("cep", "Consulta um CEP"),
+    BotCommand("clima", "Clima de uma cidade"),
+    BotCommand("insult", "Um insulto aleatorio"),
+    BotCommand("ask", "Pergunta para a IA local"),
+    BotCommand("nota", "Consulta o vault (restrito)"),
+    BotCommand("resumo", "Resumo do diario (restrito)"),
+    BotCommand("lembrete", "Cria um lembrete"),
+    BotCommand("status", "Status dos servicos"),
+    BotCommand("reset", "Limpa o historico"),
+    BotCommand("end", "Despedida"),
+]
 
 COMMANDS_TEXT = (
     "/start will say Hello World to you\n"
@@ -42,12 +114,18 @@ COMMANDS_TEXT = (
     "/time will show the hour to you\n"
     "/coin [USD] will show quotes in Real (default: USD, EUR, BTC)\n"
     "/cep <codigo> will show more information about your cep\n"
+    "/clima <cidade> will show the weather\n"
     "/insult will insult you\n"
     "/ask <question> asks the local AI (Ollama)\n"
     "/nota <question> asks using your Obsidian vault (restricted)\n"
+    "/resumo summarizes the latest diary notes (restricted)\n"
+    "/lembrete <10m> <texto> creates a reminder\n"
+    "/status shows Ollama, vault and history status\n"
     "/reset clears your conversation history\n"
     "/end will say bye bye to you"
 )
+
+RATE_HITS = {}
 
 
 def parse_allowed_ids(value):
@@ -74,6 +152,11 @@ class History:
                 "content TEXT NOT NULL,"
                 "created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
             )
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS summaries ("
+                "user_id INTEGER PRIMARY KEY,"
+                "content TEXT NOT NULL)"
+            )
 
     def _connect(self):
         return sqlite3.connect(self.path)
@@ -93,12 +176,101 @@ class History:
             ).fetchall()
         return [{"role": role, "content": content} for role, content in reversed(rows)]
 
+    def oldest(self, user_id, limit):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, role, content FROM messages WHERE user_id = ? ORDER BY id ASC LIMIT ?",
+                (user_id, limit),
+            ).fetchall()
+        return [{"id": row[0], "role": row[1], "content": row[2]} for row in rows]
+
+    def delete_ids(self, ids):
+        if not ids:
+            return
+        placeholders = ",".join("?" for _ in ids)
+        with closing(self._connect()) as connection, connection:
+            connection.execute(f"DELETE FROM messages WHERE id IN ({placeholders})", list(ids))
+
+    def count(self, user_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM messages WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return row[0]
+
+    def summary(self, user_id):
+        if user_id is None:
+            return None
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT content FROM summaries WHERE user_id = ?", (user_id,)
+            ).fetchone()
+        return row[0] if row else None
+
+    def set_summary(self, user_id, content):
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO summaries (user_id, content) VALUES (?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET content = excluded.content",
+                (user_id, content),
+            )
+
     def clear(self, user_id):
         with closing(self._connect()) as connection, connection:
             connection.execute("DELETE FROM messages WHERE user_id = ?", (user_id,))
+            connection.execute("DELETE FROM summaries WHERE user_id = ?", (user_id,))
+
+
+class ReminderStore:
+    def __init__(self, path):
+        self.path = path
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS reminders ("
+                "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "user_id INTEGER NOT NULL,"
+                "chat_id INTEGER NOT NULL,"
+                "text TEXT NOT NULL,"
+                "due_at REAL NOT NULL,"
+                "sent INTEGER NOT NULL DEFAULT 0)"
+            )
+
+    def _connect(self):
+        return sqlite3.connect(self.path)
+
+    def add(self, user_id, chat_id, text, due_at):
+        with closing(self._connect()) as connection, connection:
+            cursor = connection.execute(
+                "INSERT INTO reminders (user_id, chat_id, text, due_at) VALUES (?, ?, ?, ?)",
+                (user_id, chat_id, text, due_at),
+            )
+            return cursor.lastrowid
+
+    def pending(self):
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, chat_id, text, due_at FROM reminders "
+                "WHERE sent = 0 ORDER BY due_at"
+            ).fetchall()
+        return [
+            {"id": row[0], "chat_id": row[1], "text": row[2], "due_at": row[3]} for row in rows
+        ]
+
+    def pop(self, reminder_id):
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT chat_id, text FROM reminders WHERE id = ? AND sent = 0",
+                (reminder_id,),
+            ).fetchone()
+        if not row:
+            return None
+        with closing(self._connect()) as connection, connection:
+            connection.execute("UPDATE reminders SET sent = 1 WHERE id = ?", (reminder_id,))
+        return {"chat_id": row[0], "text": row[1]}
 
 
 HISTORY = History(DB_PATH)
+REMINDERS = ReminderStore(DB_PATH)
 
 
 def get_user_id(update):
@@ -111,11 +283,46 @@ def truncate(text, limit=REPLY_LIMIT):
     return text[: limit - 3] + "..."
 
 
-def format_number(value):
+def format_number(value, decimals=2):
     try:
-        return f"{float(value):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        number = f"{float(value):,.{decimals}f}"
+        return number.replace(",", "X").replace(".", ",").replace("X", ".")
     except (TypeError, ValueError):
         return str(value)
+
+
+def format_duration(seconds):
+    seconds = int(seconds)
+    if seconds >= 86400:
+        return f"{seconds // 86400}d"
+    if seconds >= 3600:
+        return f"{seconds // 3600}h"
+    if seconds >= 60:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
+def parse_duration(value):
+    match = DURATION_RE.match((value or "").lower())
+    if not match:
+        return None
+    seconds = int(match.group(1)) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+    if seconds <= 0 or seconds > REMINDER_MAX_SECONDS:
+        return None
+    return seconds
+
+
+def check_rate_limit(user_id, limit=RATE_LIMIT_PER_MINUTE, window=60.0):
+    if user_id is None:
+        return False
+    now = time.monotonic()
+    hits = [hit for hit in RATE_HITS.get(user_id, []) if now - hit < window]
+    if len(hits) >= limit:
+        RATE_HITS[user_id] = hits
+        return False
+    hits.append(now)
+    RATE_HITS[user_id] = hits
+    return True
 
 
 def parse_pairs(args):
@@ -137,17 +344,30 @@ def parse_pairs(args):
 def format_coin(data, pairs):
     lines = []
     for pair in pairs:
-        quote = data.get(pair.replace("-", ""))
-        if not quote:
+        quote_data = data.get(pair.replace("-", ""))
+        if not quote_data:
             continue
-        line = f"{quote.get('name', pair)}: R$ {format_number(quote.get('bid'))}"
+        line = f"{quote_data.get('name', pair)}: R$ {format_number(quote_data.get('bid'))}"
         try:
-            change = f"{float(quote['pctChange']):+.2f}%".replace(".", ",")
+            change = f"{float(quote_data['pctChange']):+.2f}%".replace(".", ",")
             line += f" ({change})"
         except (KeyError, TypeError, ValueError):
             pass
         lines.append(line)
     return "\n".join(lines)
+
+
+def format_weather(place, data):
+    current = data["current"]
+    local = ", ".join(part for part in (place.get("name"), place.get("country")) if part)
+    temperature = format_number(current["temperature_2m"], 1)
+    apparent = format_number(current["apparent_temperature"], 1)
+    description = WEATHER_CODES.get(current.get("weather_code"), "Condicao desconhecida")
+    return (
+        f"Clima em {local}\n"
+        f"Temperatura: {temperature} C (sensacao {apparent} C)\n"
+        f"{description}"
+    )
 
 
 def format_cep(data):
@@ -159,6 +379,18 @@ def format_cep(data):
 
 def format_insult(data):
     return f"Insult: \n{data['insult']}"
+
+
+def coin_keyboard(pairs):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Atualizar", callback_data="coin:" + ",".join(pairs))]]
+    )
+
+
+def history_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Limpar historico", callback_data="history:reset")]]
+    )
 
 
 def normalize_cep(value):
@@ -173,6 +405,16 @@ async def fetch_json(url, timeout=HTTP_TIMEOUT, transport=None):
         return response.json()
 
 
+async def probe(url, timeout=HTTP_TIMEOUT):
+    try:
+        async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return True
+    except httpx.HTTPError:
+        return False
+
+
 async def chat(messages, base_url, timeout=LLM_TIMEOUT):
     payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False}
     url = f"{base_url.rstrip('/')}/api/chat"
@@ -180,6 +422,123 @@ async def chat(messages, base_url, timeout=LLM_TIMEOUT):
         response = await client.post(url, json=payload)
         response.raise_for_status()
         return response.json()["message"]["content"].strip()
+
+
+async def stream_chat(messages, base_url, timeout=LLM_TIMEOUT):
+    payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": True}
+    url = f"{base_url.rstrip('/')}/api/chat"
+    async with httpx.AsyncClient(trust_env=False, timeout=timeout) as client:
+        async with client.stream("POST", url, json=payload) as response:
+            response.raise_for_status()
+            async for line in response.aiter_lines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except ValueError:
+                    continue
+                content = (item.get("message") or {}).get("content") or ""
+                if content:
+                    yield content
+
+
+async def service_status():
+    status = {"ollama": False, "model": False, "vault": False}
+    try:
+        data = await fetch_json(f"{OLLAMA_URL}/api/tags")
+        names = [item.get("name", "") for item in data.get("models", [])]
+        status["ollama"] = True
+        status["model"] = OLLAMA_MODEL in names
+    except (httpx.HTTPError, ValueError, KeyError):
+        pass
+    status["vault"] = await probe(f"{VAULT_PROXY_URL}/health")
+    return status
+
+
+def build_messages(user_id, question):
+    prompt = SYSTEM_PROMPT
+    summary = HISTORY.summary(user_id)
+    if summary:
+        prompt += f"\nResumo da conversa anterior: {summary}"
+    messages = [{"role": "system", "content": prompt}]
+    messages += HISTORY.recent(user_id)
+    messages.append({"role": "user", "content": question})
+    return messages
+
+
+async def compact_history(user_id, base_url):
+    if HISTORY.count(user_id) <= HISTORY_THRESHOLD:
+        return
+    old = HISTORY.oldest(user_id, HISTORY_THRESHOLD - HISTORY_LIMIT)
+    if not old:
+        return
+    transcript = "\n".join(f"{item['role']}: {item['content']}" for item in old)
+    prompt = (
+        "Resuma em poucas frases, em portugues, os fatos e preferencias desta conversa. "
+        "Nao invente nada."
+    )
+    previous = HISTORY.summary(user_id)
+    if previous:
+        prompt += f"\nResumo anterior: {previous}"
+    try:
+        summary = await chat(
+            [{"role": "user", "content": f"{prompt}\n\n{transcript}"}], base_url
+        )
+    except (httpx.HTTPError, ValueError, KeyError):
+        return
+    HISTORY.delete_ids([item["id"] for item in old])
+    HISTORY.set_summary(user_id, summary)
+
+
+async def safe_edit(message, text, reply_markup=None):
+    try:
+        await message.edit_text(truncate(text), reply_markup=reply_markup)
+    except TelegramError:
+        pass
+
+
+def vault_allowed(update):
+    user_id = get_user_id(update)
+    if not ALLOWED_USER_IDS:
+        return False, "Vault access is not configured. Set ALLOWED_USER_IDS to enable it."
+    if user_id is None or user_id not in ALLOWED_USER_IDS:
+        return False, "You are not allowed to query the vault."
+    return True, ""
+
+
+async def answer_with_llm(update, question, base_url, error_text):
+    user_id = get_user_id(update)
+    if user_id is None:
+        await update.message.reply_text("This command is not available in this chat.")
+        return
+    if not check_rate_limit(user_id):
+        await update.message.reply_text(
+            f"Rate limit: max {RATE_LIMIT_PER_MINUTE} perguntas por minuto. Tente em instantes."
+        )
+        return
+    messages = build_messages(user_id, question)
+    placeholder = await update.message.reply_text("Pensando...")
+    parts = []
+    last_edit = 0.0
+    try:
+        async for chunk in stream_chat(messages, base_url):
+            parts.append(chunk)
+            if time.monotonic() - last_edit >= EDIT_INTERVAL:
+                last_edit = time.monotonic()
+                await safe_edit(placeholder, "".join(parts))
+    except (httpx.HTTPError, ValueError, KeyError):
+        answer = "".join(parts).strip()
+        await safe_edit(placeholder, answer if answer else error_text)
+        return
+    answer = "".join(parts).strip()
+    if not answer:
+        await safe_edit(placeholder, error_text)
+        return
+    await safe_edit(placeholder, answer, reply_markup=history_keyboard())
+    HISTORY.add(user_id, "user", question)
+    HISTORY.add(user_id, "assistant", answer)
+    await compact_history(user_id, base_url)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -213,7 +572,36 @@ async def coin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except (httpx.HTTPError, ValueError, KeyError):
         await update.message.reply_text("Could not fetch quotes right now. Try again later.")
         return
-    await update.message.reply_text(format_coin(data, pairs) or "No quotes found for those codes.")
+    text = format_coin(data, pairs) or "No quotes found for those codes."
+    await update.message.reply_text(text, reply_markup=coin_keyboard(pairs))
+
+
+async def coin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    pairs = [pair for pair in query.data.removeprefix("coin:").split(",") if PAIR_RE.match(pair)]
+    pairs = pairs or list(DEFAULT_COINS)
+    try:
+        data = await fetch_json(COIN_URL.format(pairs=",".join(pairs)))
+        text = format_coin(data, pairs) or "No quotes found for those codes."
+    except (httpx.HTTPError, ValueError, KeyError):
+        text = "Could not fetch quotes right now. Try again later."
+    try:
+        await query.edit_message_text(text, reply_markup=coin_keyboard(pairs))
+    except TelegramError:
+        pass
+
+
+async def history_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id if query.from_user else None
+    if user_id is not None:
+        HISTORY.clear(user_id)
+    await query.answer("Historico limpo.")
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except TelegramError:
+        pass
 
 
 async def cep(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -235,6 +623,27 @@ async def cep(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(format_cep(data))
 
 
+async def clima(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    city = " ".join(context.args or []).strip()
+    if not city:
+        await update.message.reply_text("Usage: /clima <cidade> e.g. /clima Sao Paulo")
+        return
+    try:
+        geo = await fetch_json(GEO_URL.format(city=quote(city)))
+        results = geo.get("results") or []
+        if not results:
+            await update.message.reply_text("City not found. Try another name.")
+            return
+        place = results[0]
+        weather = await fetch_json(
+            WEATHER_URL.format(latitude=place["latitude"], longitude=place["longitude"])
+        )
+    except (httpx.HTTPError, ValueError, KeyError):
+        await update.message.reply_text("Could not fetch the weather right now. Try again later.")
+        return
+    await update.message.reply_text(format_weather(place, weather))
+
+
 async def insult(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         data = await fetch_json(INSULT_URL)
@@ -249,48 +658,83 @@ async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not question:
         await update.message.reply_text("Usage: /ask <question>")
         return
-    user_id = get_user_id(update)
-    if user_id is None:
-        await update.message.reply_text("This command is not available in this chat.")
-        return
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += HISTORY.recent(user_id)
-    messages.append({"role": "user", "content": question})
-    try:
-        answer = await chat(messages, OLLAMA_URL)
-    except (httpx.HTTPError, ValueError, KeyError):
-        await update.message.reply_text("Could not reach the local AI right now. Try again later.")
-        return
-    HISTORY.add(user_id, "user", question)
-    HISTORY.add(user_id, "assistant", answer)
-    await update.message.reply_text(truncate(answer))
+    await answer_with_llm(
+        update, question, OLLAMA_URL, "Could not reach the local AI right now. Try again later."
+    )
 
 
 async def nota(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = get_user_id(update)
-    if not ALLOWED_USER_IDS:
-        await update.message.reply_text(
-            "Vault access is not configured. Set ALLOWED_USER_IDS to enable /nota."
-        )
-        return
-    if user_id is None or user_id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("You are not allowed to query the vault.")
+    allowed, reason = vault_allowed(update)
+    if not allowed:
+        await update.message.reply_text(reason)
         return
     question = " ".join(context.args or []).strip()
     if not question:
         await update.message.reply_text("Usage: /nota <question>")
         return
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages += HISTORY.recent(user_id)
-    messages.append({"role": "user", "content": question})
-    try:
-        answer = await chat(messages, VAULT_PROXY_URL)
-    except (httpx.HTTPError, ValueError, KeyError):
-        await update.message.reply_text("Could not reach the vault right now. Try again later.")
+    await answer_with_llm(
+        update, question, VAULT_PROXY_URL, "Could not reach the vault right now. Try again later."
+    )
+
+
+async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed, reason = vault_allowed(update)
+    if not allowed:
+        await update.message.reply_text(reason)
         return
-    HISTORY.add(user_id, "user", question)
-    HISTORY.add(user_id, "assistant", answer)
-    await update.message.reply_text(truncate(answer))
+    await answer_with_llm(
+        update,
+        RESUMO_QUESTION,
+        VAULT_PROXY_URL,
+        "Could not reach the vault right now. Try again later.",
+    )
+
+
+async def lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    seconds = parse_duration(context.args[0]) if context.args else None
+    text = " ".join(context.args[1:]).strip() if context.args else ""
+    if not seconds or not text:
+        await update.message.reply_text("Usage: /lembrete 10m tomar agua (s/m/h/d)")
+        return
+    reminder_id = REMINDERS.add(
+        get_user_id(update), update.effective_chat.id, text, time.time() + seconds
+    )
+    context.job_queue.run_once(
+        send_reminder, when=seconds, data=reminder_id, name=f"reminder:{reminder_id}"
+    )
+    await update.message.reply_text(f"Lembrete em {format_duration(seconds)}: {text}")
+
+
+async def send_reminder(context: ContextTypes.DEFAULT_TYPE):
+    reminder = REMINDERS.pop(context.job.data)
+    if reminder:
+        await context.bot.send_message(reminder["chat_id"], f"Lembrete: {reminder['text']}")
+
+
+def reschedule_reminders(application):
+    if application.job_queue is None:
+        return
+    now = time.time()
+    for reminder in REMINDERS.pending():
+        delay = max(reminder["due_at"] - now, 1.0)
+        application.job_queue.run_once(
+            send_reminder, when=delay, data=reminder["id"], name=f"reminder:{reminder['id']}"
+        )
+
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    info = await service_status()
+    user_id = get_user_id(update)
+    history_count = HISTORY.count(user_id) if user_id is not None else 0
+    lines = [
+        f"Ollama: {'online' if info['ollama'] else 'offline'} ({OLLAMA_URL})",
+        f"Modelo {OLLAMA_MODEL}: {'disponivel' if info['model'] else 'nao encontrado'}",
+        f"Vault: {'online' if info['vault'] else 'offline'} ({VAULT_PROXY_URL})",
+        f"Historico deste usuario: {history_count} mensagens",
+        f"Lembretes pendentes: {len(REMINDERS.pending())}",
+        f"Uptime: {format_duration(time.monotonic() - START_TIME)}",
+    ]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -301,15 +745,34 @@ async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(update.message.text)
+    message = update.message
+    if message.chat.type != "private":
+        username = context.bot.username
+        if not username or f"@{username.lower()}" not in (message.text or "").lower():
+            return
+    await message.reply_text(message.text)
 
 
 async def error(update, context: ContextTypes.DEFAULT_TYPE):
     logger.warning('Update "%s" caused error "%s"', update, context.error)
 
 
+async def post_init(application):
+    try:
+        await application.bot.set_my_commands(BOT_COMMANDS)
+    except TelegramError:
+        logger.warning("Could not register bot commands")
+    reschedule_reminders(application)
+
+
 def build_application(token):
-    application = Application.builder().token(token).concurrent_updates(True).build()
+    application = (
+        Application.builder()
+        .token(token)
+        .concurrent_updates(True)
+        .post_init(post_init)
+        .build()
+    )
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("commands", commands))
@@ -317,10 +780,18 @@ def build_application(token):
     application.add_handler(CommandHandler("time", time_command))
     application.add_handler(CommandHandler("coin", coin))
     application.add_handler(CommandHandler("cep", cep))
+    application.add_handler(CommandHandler("clima", clima))
     application.add_handler(CommandHandler("insult", insult))
     application.add_handler(CommandHandler("ask", ask))
     application.add_handler(CommandHandler("nota", nota))
+    application.add_handler(CommandHandler("resumo", resumo))
+    application.add_handler(CommandHandler("lembrete", lembrete))
+    application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("reset", reset))
+    application.add_handler(CallbackQueryHandler(coin_callback, pattern=r"^coin:"))
+    application.add_handler(
+        CallbackQueryHandler(history_callback, pattern=r"^history:reset$")
+    )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     application.add_error_handler(error)
     return application
@@ -330,7 +801,16 @@ def main():
     token = os.environ.get(TOKEN_ENV)
     if not token:
         raise SystemExit(f"Set {TOKEN_ENV} in the environment before running the bot.")
-    build_application(token).run_polling()
+    if ":" not in token:
+        raise SystemExit(
+            f"{TOKEN_ENV} looks invalid. Use the BotFather token (123456:AA...), not a user ID."
+        )
+    try:
+        build_application(token).run_polling()
+    except InvalidToken:
+        raise SystemExit(
+            f"Telegram rejected {TOKEN_ENV}. Get a fresh token from @BotFather and update .env."
+        ) from None
 
 
 if __name__ == "__main__":
