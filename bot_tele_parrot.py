@@ -9,6 +9,7 @@ from datetime import datetime
 from urllib.parse import quote
 
 import httpx
+from extra_commands import guia, register_extras
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
@@ -91,7 +92,7 @@ WEATHER_CODES = {
 
 BOT_COMMANDS = [
     BotCommand("start", "Diz Hello World"),
-    BotCommand("help", "Nao ajuda em nada"),
+    BotCommand("help", "Guia de recursos e exemplos"),
     BotCommand("commands", "Lista os comandos"),
     BotCommand("time", "Data e hora atuais"),
     BotCommand("coin", "Cotacoes em BRL"),
@@ -109,7 +110,11 @@ BOT_COMMANDS = [
 
 COMMANDS_TEXT = (
     "/start will say Hello World to you\n"
-    "/help will not help you\n"
+    "/help e /guia mostram recursos e exemplos\n"
+    "/meuid mostra seu ID\n"
+    "/traduzir ingles Bom dia traduz um texto\n"
+    "/tarefa <titulo> cria uma tarefa no Notion (restrito)\n"
+    "Envie uma mensagem de voz para transcrever (restrito)\n"
     "/commands you already understand\n"
     "/time will show the hour to you\n"
     "/coin [USD] will show quotes in Real (default: USD, EUR, BTC)\n"
@@ -499,6 +504,8 @@ async def safe_edit(message, text, reply_markup=None):
 
 
 def vault_allowed(update):
+    if update.effective_chat.type != "private":
+        return False, "Consulte suas notas apenas na conversa privada comigo."
     user_id = get_user_id(update)
     if not ALLOWED_USER_IDS:
         return False, "Vault access is not configured. Set ALLOWED_USER_IDS to enable it."
@@ -508,6 +515,9 @@ def vault_allowed(update):
 
 
 async def answer_with_llm(update, question, base_url, error_text):
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use a conversa privada para manter seu histórico reservado.")
+        return
     user_id = get_user_id(update)
     if user_id is None:
         await update.message.reply_text("This command is not available in this chat.")
@@ -546,7 +556,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Nobody will help you!")
+    await guia(update, context)
 
 
 async def commands(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -754,12 +764,14 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error(update, context: ContextTypes.DEFAULT_TYPE):
-    logger.warning('Update "%s" caused error "%s"', update, context.error)
+    logger.warning("Falha no processamento: %s", type(context.error).__name__)
 
 
 async def post_init(application):
     try:
-        await application.bot.set_my_commands(BOT_COMMANDS)
+        await application.bot.set_my_commands(
+            BOT_COMMANDS + application.bot_data.get("extra_commands", [])
+        )
     except TelegramError:
         logger.warning("Could not register bot commands")
     reschedule_reminders(application)
@@ -788,6 +800,13 @@ def build_application(token):
     application.add_handler(CommandHandler("lembrete", lembrete))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("reset", reset))
+    async def translate_answer(update, prompt):
+        await answer_with_llm(update, prompt, OLLAMA_URL, "IA local indisponível. Tente novamente.")
+
+    application.bot_data["extra_commands"] = register_extras(
+        application, allowed_ids=ALLOWED_USER_IDS,
+        rate_limit=check_rate_limit, answer=translate_answer,
+    )
     application.add_handler(CallbackQueryHandler(coin_callback, pattern=r"^coin:"))
     application.add_handler(
         CallbackQueryHandler(history_callback, pattern=r"^history:reset$")

@@ -329,7 +329,7 @@ def test_coin_callback_refreshes(monkeypatch):
 def test_simple_commands_reply():
     for handler, expected in [
         (bot.start, "Hello World!"),
-        (bot.help_command, "Nobody will help"),
+        (bot.help_command, "O que posso fazer"),
         (bot.end, "Bye Bye!"),
     ]:
         update, context = FakeUpdate(), FakeContext()

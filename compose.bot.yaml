@@ -1,0 +1,8 @@
+# Merge with the ai-stack compose file (see README).
+services:
+  telegram-bot:
+    environment:
+      NOTION_TOKEN: ${NOTION_TOKEN:-}
+      NOTION_DATA_SOURCE_ID: ${NOTION_DATA_SOURCE_ID:-}
+      WHISPER_MODEL: ${WHISPER_MODEL:-base}
+      WHISPER_CACHE: /data/whisper
