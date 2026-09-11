@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt requirements-audio.txt ./
 RUN pip install --no-cache-dir -r requirements-audio.txt
 
-COPY bot_tele_parrot.py integrations.py extra_commands.py ./
+COPY bot_tele_parrot.py integrations.py extra_commands.py deals.py ./
 
 RUN useradd --system --create-home bot \
     && mkdir -p /data \

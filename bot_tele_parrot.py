@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+from deals import DealStore, deals_summary_prompt, format_deal, format_deal_alert, parse_deal
 from extra_commands import guia, register_extras
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
@@ -58,6 +59,9 @@ VAULT_PROXY_URL = os.environ.get("VAULT_PROXY_URL", "http://127.0.0.1:11435")
 ESTUDOS_PROXY_URL = os.environ.get("ESTUDOS_PROXY_URL", "http://127.0.0.1:11436")
 ESTUDOS_PATH = os.environ.get("ESTUDOS_PATH", "/estudos")
 TOPIC_LIMIT = 8000
+DEALS_WINDOW_HOURS = int(os.environ.get("DEALS_WINDOW_HOURS", "24"))
+DEALS_TOP = int(os.environ.get("DEALS_TOP", "5"))
+DEALS_ALERT_PERCENT = int(os.environ.get("DEALS_ALERT_PERCENT", "50"))
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_history.db")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
@@ -116,6 +120,7 @@ BOT_COMMANDS = [
     BotCommand("ask", "Pergunta para a IA local (restrito)"),
     BotCommand("estudo", "Sorteia um tópico ou pergunta (restrito)"),
     BotCommand("topicos", "Lista os tópicos de estudos (restrito)"),
+    BotCommand("ofertas", "Melhores ofertas dos grupos (restrito)"),
     BotCommand("nota", "Consulta o vault (restrito)"),
     BotCommand("resumo", "Resumo do diario (restrito)"),
     BotCommand("lembrete", "Cria um lembrete (restrito)"),
@@ -141,6 +146,7 @@ COMMANDS_TEXT = (
     "/estudo <question> asks the study tutor (restricted)\n"
     "/estudo sem argumento sorteia um tópico com resumo (restricted)\n"
     "/topicos lists the study topics (restricted)\n"
+    "/ofertas shows the best captured deals (restricted)\n"
     "/nota <question> asks using your Obsidian vault (restricted)\n"
     "/resumo summarizes the latest diary notes (restricted)\n"
     "/lembrete <10m> <texto> creates a reminder (restricted)\n"
@@ -295,6 +301,7 @@ class ReminderStore:
 
 HISTORY = History(DB_PATH)
 REMINDERS = ReminderStore(DB_PATH)
+DEALS = DealStore(DB_PATH)
 
 
 def get_user_id(update):
@@ -420,6 +427,12 @@ def history_keyboard():
 def topic_keyboard():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Outro tópico", callback_data="estudo:random")]]
+    )
+
+
+def deals_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Resumo com IA", callback_data="deals:summary")]]
     )
 
 
@@ -868,6 +881,82 @@ async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def capture_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message
+    if message.chat.type not in ("group", "supergroup"):
+        return
+    deal = parse_deal(message.text or "")
+    if not deal:
+        return
+    if not DEALS.add(message.chat.id, message.message_id, deal):
+        return
+    if DEALS_ALERT_PERCENT <= 0 or not deal.get("discount"):
+        return
+    if deal["discount"] < DEALS_ALERT_PERCENT:
+        return
+    for user_id in ALLOWED_USER_IDS:
+        try:
+            await context.bot.send_message(user_id, format_deal_alert(deal))
+        except TelegramError:
+            pass
+
+
+async def ofertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
+    if update.effective_chat.type != "private":
+        await update.message.reply_text("Use a conversa privada para ver suas ofertas.")
+        return
+    term = " ".join(context.args or []).strip() or None
+    deals = DEALS.top(limit=DEALS_TOP, hours=DEALS_WINDOW_HOURS, term=term)
+    if not deals:
+        await update.message.reply_text(
+            f"Nenhuma oferta capturada nas últimas {DEALS_WINDOW_HOURS}h. "
+            "Adicione o bot aos grupos de promoções."
+        )
+        return
+    blocks = [format_deal(deal, index) for index, deal in enumerate(deals, start=1)]
+    text = f"Melhores ofertas (últimas {DEALS_WINDOW_HOURS}h, por desconto):\n\n"
+    text += "\n\n".join(blocks)
+    await update.message.reply_text(truncate(text), reply_markup=deals_keyboard())
+
+
+async def deals_summary_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Acesso restrito.", show_alert=True)
+        return
+    user_id = query.from_user.id if query.from_user else None
+    if not check_rate_limit(user_id):
+        await query.answer("Muitas solicitações. Aguarde um minuto.", show_alert=True)
+        return
+    deals = DEALS.top(limit=DEALS_TOP, hours=DEALS_WINDOW_HOURS)
+    if not deals:
+        await query.answer("Sem ofertas para resumir.", show_alert=True)
+        return
+    await query.answer()
+    message = query.message
+    await safe_edit(message, "Resumindo com a IA local...")
+    parts = []
+    last_edit = 0.0
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": deals_summary_prompt(deals)},
+    ]
+    try:
+        async for chunk in stream_chat(messages, OLLAMA_URL):
+            parts.append(chunk)
+            if time.monotonic() - last_edit >= EDIT_INTERVAL:
+                last_edit = time.monotonic()
+                await safe_edit(message, "Resumo IA:\n\n" + "".join(parts))
+    except (httpx.HTTPError, ValueError, KeyError):
+        await safe_edit(message, "Não consegui resumir as ofertas agora. Tente de novo.")
+        return
+    answer = "".join(parts).strip()
+    final = ("Resumo IA:\n\n" + answer) if answer else "Não consegui resumir as ofertas agora."
+    await safe_edit(message, final)
+
+
 async def lembrete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed(update):
         return
@@ -970,6 +1059,7 @@ def build_application(token):
     application.add_handler(CommandHandler("nota", nota))
     application.add_handler(CommandHandler("estudo", estudo))
     application.add_handler(CommandHandler("topicos", topicos))
+    application.add_handler(CommandHandler("ofertas", ofertas))
     application.add_handler(CommandHandler("resumo", resumo))
     application.add_handler(CommandHandler("lembrete", lembrete))
     application.add_handler(CommandHandler("status", status))
@@ -987,6 +1077,12 @@ def build_application(token):
     )
     application.add_handler(
         CallbackQueryHandler(estudo_callback, pattern=r"^estudo:random$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(deals_summary_callback, pattern=r"^deals:summary$")
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS, capture_deal)
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     application.add_error_handler(error)

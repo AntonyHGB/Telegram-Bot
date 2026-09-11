@@ -29,6 +29,11 @@ Organização (restrito)
 /lembrete 10m tomar água — agendar um aviso
 /tarefa Revisar currículo — criar uma tarefa no Notion configurado
 
+Ofertas dos grupos (restrito, conversa privada)
+/ofertas — melhores ofertas capturadas, ordenadas pelo maior desconto
+/ofertas ssd — filtra as ofertas por termo ou loja
+Botão "Resumo com IA" — a IA local aponta as 3 mais interessantes
+
 Suas notas (restrito, conversa privada)
 /nota o que anotei sobre estudos? — consultar o vault
 /resumo — pedir um resumo das notas de diário
@@ -47,6 +52,7 @@ Ajuda
 /insult — comando de humor com conteúdo externo
 
 /tarefa precisa da integração do Notion configurada.
+Para capturar ofertas, desative o privacy mode no BotFather e adicione o bot aos grupos.
 A IA pode errar: confira informações importantes e fontes citadas."""
 
 

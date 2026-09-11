@@ -2,11 +2,12 @@
 
 Bot experimental para Telegram, criado para aprender `python-telegram-bot`. Responde a
 comandos, consulta APIs públicas simples (moedas, CEP e clima), transcreve mensagens de
-voz em CPU e usa a IA local (Ollama) para responder perguntas, guardando o histórico em
-SQLite. Tudo que usa IA ou dados pessoais (incluindo `/estudo`, `/nota`, `/resumo`, voz e
-`/tarefa`) é **fechado por padrão**: só funciona para IDs em `ALLOWED_USER_IDS`. As notas
-vêm do vault Obsidian via `vault-proxy`, o material de estudos do `estudos-proxy` e as
-tarefas vão para um Notion configurado pelo próprio bot.
+voz em CPU, monitora grupos de promoções e usa a IA local (Ollama) para responder
+perguntas, guardando o histórico em SQLite. Tudo que usa IA ou dados pessoais (incluindo
+`/estudo`, `/nota`, `/resumo`, voz, `/tarefa` e `/ofertas`) é **fechado por padrão**: só
+funciona para IDs em `ALLOWED_USER_IDS`. As notas vêm do vault Obsidian via `vault-proxy`,
+o material de estudos do `estudos-proxy` e as tarefas vão para um Notion configurado pelo
+próprio bot.
 
 ## Requisitos
 
@@ -49,6 +50,9 @@ Variáveis reconhecidas:
 | `ESTUDOS_PATH` | `/estudos` | pasta local do corpus, montada somente leitura no Docker |
 | `BOT_DB_PATH` | `bot_history.db` | banco SQLite do histórico e lembretes |
 | `RATE_LIMIT_PER_MINUTE` | `5` | limite de perguntas/minuto na IA, `/tarefa` e voz |
+| `DEALS_WINDOW_HOURS` | `24` | janela de tempo do `/ofertas` |
+| `DEALS_TOP` | `5` | quantas ofertas o `/ofertas` mostra |
+| `DEALS_ALERT_PERCENT` | `50` | desconto mínimo (%) para receber alerta em DM; `0` desliga |
 | `NOTION_TOKEN` | vazio | credencial da integração interna do Notion |
 | `NOTION_DATA_SOURCE_ID` | vazio | data source onde `/tarefa` cria páginas |
 | `WHISPER_MODEL` | `base` | tamanho do modelo Whisper (`tiny`/`base`/`small`...) |
@@ -84,6 +88,7 @@ Se `TELEGRAM_BOT_TOKEN` não estiver definido, o programa encerra com uma mensag
 | `/estudo <pergunta>` | Pergunta ao tutor sobre o material de estudos (restrito) |
 | `/estudo` | Sorteia um tópico do corpus e devolve um resumo, com botão "Outro tópico" (restrito) |
 | `/topicos` | Lista os tópicos de estudos disponíveis (restrito) |
+| `/ofertas [termo]` | Melhores ofertas capturadas dos grupos, por desconto (restrito) |
 | `/resumo` | Resume as notas de diário mais recentes do vault (restrito) |
 | `/lembrete 10m texto` | Agenda um lembrete (`s`/`m`/`h`/`d`), persistido em SQLite (restrito) |
 | `/tarefa <titulo>` | Cria uma página no Notion configurado (restrito) |
@@ -139,6 +144,33 @@ de até 3500 caracteres e **não** é enviada automaticamente para a IA nem para
 - No Docker o cache fica em `/data/whisper`, dentro do volume `bot_data`, então
   sobrevive a rebuilds. O modelo `base` ocupa ~150 MB e roda em português.
 
+## Ofertas dos grupos (Telegram)
+
+Para o bot capturar promoções automaticamente:
+
+1. No BotFather, envie `/setprivacy` → escolha **testando_tudo** → **Disable**. Sem isso
+   ele só recebe mensagens que mencionam o bot.
+2. Adicione o bot aos grupos de promoções (se o grupo restringe, peça ao admin). Se ele
+   já estava no grupo antes de desativar o privacy mode, remova e adicione de novo.
+3. A partir daí, cada mensagem de texto em grupo é analisada **localmente** por regex
+   (R$, "de/por", % off, cupom, loja e link). O bot não responde nos grupos e só grava o
+   que parece oferta, no SQLite (`deals`), dentro do volume `bot_data`.
+
+O bot **não lê o histórico** dos grupos: a captura começa quando ele entra (ou é
+re-adicionado). O parsing é por regras — o LLM não fica varrendo as mensagens, o que
+seria lento e impreciso; a IA entra só no botão de resumo.
+
+Comandos:
+
+- `/ofertas` — top `DEALS_TOP` das últimas `DEALS_WINDOW_HOURS`, ordenado pelo maior
+  desconto (o que não tem desconto aparece depois).
+- `/ofertas <termo>` — filtra por texto ou loja, ex.: `/ofertas ssd` ou `/ofertas shopee`.
+- Botão **"Resumo com IA"** — o `qwen2.5:3b` aponta as 3 mais interessantes.
+
+Alertas: quando o desconto é maior ou igual a `DEALS_ALERT_PERCENT` (padrão 50%), o bot
+manda uma DM para cada ID em `ALLOWED_USER_IDS`. Duplicatas com o mesmo link são
+ignoradas por 6 horas. `/ofertas` é restrito e só funciona na conversa privada.
+
 ## Notion (`/tarefa`)
 
 A integração é independente do MCP do Notion usado pelo OpenCode: o bot fala direto com
@@ -189,10 +221,11 @@ pytest
 ruff check .
 ```
 
-Os testes (71) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
+Os testes (89) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
 histórico SQLite, sumarização, lembretes, autorização, rate limit, echo em grupo,
-seleção de tópicos de estudo, transcrição de voz (com mock), criação de tarefa no Notion
-(com `httpx.MockTransport`) e o registro dos handlers, sem rede nem token real.
+seleção de tópicos de estudo, parsing/ranking de ofertas, transcrição de voz (com mock),
+criação de tarefa no Notion (com `httpx.MockTransport`) e o registro dos handlers, sem
+rede nem token real.
 
 ## Estrutura
 
@@ -200,6 +233,7 @@ seleção de tópicos de estudo, transcrição de voz (com mock), criação de t
 .
 ├── bot_tele_parrot.py     # handlers, histórico SQLite, integrações HTTP e entrypoint
 ├── extra_commands.py      # /guia, /meuid, /traduzir, /tarefa e transcrição de voz
+├── deals.py               # parsing, score e storage das ofertas dos grupos
 ├── integrations.py        # faster-whisper + cliente independente do Notion
 ├── Dockerfile             # imagem usada pelo serviço telegram-bot da ai-stack
 ├── compose.bot.yaml       # override opcional do compose da ai-stack
@@ -210,6 +244,7 @@ seleção de tópicos de estudo, transcrição de voz (com mock), criação de t
 ├── .env.example
 └── tests/
     ├── test_bot.py
+    ├── test_deals.py
     └── test_extras.py
 ```
 
@@ -228,3 +263,5 @@ da ai-stack, e o acesso ficou **fail-closed**: todos os comandos de IA/dados
 `ALLOWED_USER_IDS`, e o prompt do modelo não finge conhecer a configuração do bot.
 Em 2026-09-11 (fase 4) ganhou `/estudo` sem argumento sorteando um tópico com resumo e
 botão "Outro tópico", além de `/topicos` para listar o corpus local.
+Em 2026-09-11 (fase 5) ganhou captura de ofertas dos grupos (`/ofertas`, alertas por
+desconto e resumo com IA), ativada ao desativar o privacy mode no BotFather.

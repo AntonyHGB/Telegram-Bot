@@ -7,5 +7,8 @@ services:
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       WHISPER_CACHE: /data/whisper
       ESTUDOS_PATH: /estudos
+      DEALS_WINDOW_HOURS: ${DEALS_WINDOW_HOURS:-24}
+      DEALS_TOP: ${DEALS_TOP:-5}
+      DEALS_ALERT_PERCENT: ${DEALS_ALERT_PERCENT:-50}
     volumes:
       - /home/antonio/Projetos/estudos:/estudos:ro

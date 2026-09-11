@@ -19,6 +19,7 @@ class FakeMessage:
         self.texts = []
         self.markups = []
         self.text = None
+        self.message_id = 1
         self.chat = chat or FakeChat()
 
     async def reply_text(self, text, reply_markup=None, **kwargs):
