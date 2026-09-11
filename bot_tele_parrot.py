@@ -1,11 +1,13 @@
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
 from contextlib import closing
 from datetime import datetime
+from pathlib import Path
 from urllib.parse import quote
 
 import httpx
@@ -54,6 +56,8 @@ WEATHER_URL = (
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434")
 VAULT_PROXY_URL = os.environ.get("VAULT_PROXY_URL", "http://127.0.0.1:11435")
 ESTUDOS_PROXY_URL = os.environ.get("ESTUDOS_PROXY_URL", "http://127.0.0.1:11436")
+ESTUDOS_PATH = os.environ.get("ESTUDOS_PATH", "/estudos")
+TOPIC_LIMIT = 8000
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_history.db")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
@@ -66,6 +70,11 @@ SYSTEM_PROMPT = (
 RESUMO_QUESTION = (
     "Resuma o que esta registrado nas notas de diario mais recentes do vault: "
     "o que foi feito, o que ficou pendente e prioridades. Use topicos curtos."
+)
+TOPIC_SYSTEM_PROMPT = "Voce e um tutor de estudos. Explique em portugues, de forma clara."
+TOPIC_QUESTION = (
+    "Resuma o material abaixo em topicos curtos, destacando definicoes, pontos-chave "
+    "e um exemplo se existir. Use apenas o material, sem inventar."
 )
 
 PAIR_RE = re.compile(r"^[A-Z]{3}-[A-Z]{3}$")
@@ -105,7 +114,8 @@ BOT_COMMANDS = [
     BotCommand("clima", "Clima de uma cidade"),
     BotCommand("insult", "Um insulto aleatorio"),
     BotCommand("ask", "Pergunta para a IA local (restrito)"),
-    BotCommand("estudo", "Consulta o tutor de estudos (restrito)"),
+    BotCommand("estudo", "Sorteia um tópico ou pergunta (restrito)"),
+    BotCommand("topicos", "Lista os tópicos de estudos (restrito)"),
     BotCommand("nota", "Consulta o vault (restrito)"),
     BotCommand("resumo", "Resumo do diario (restrito)"),
     BotCommand("lembrete", "Cria um lembrete (restrito)"),
@@ -128,7 +138,9 @@ COMMANDS_TEXT = (
     "/clima <cidade> will show the weather\n"
     "/insult will insult you\n"
     "/ask <question> asks the local AI (restricted)\n"
-    "/estudo <question> asks using the study material (restricted)\n"
+    "/estudo <question> asks the study tutor (restricted)\n"
+    "/estudo sem argumento sorteia um tópico com resumo (restricted)\n"
+    "/topicos lists the study topics (restricted)\n"
     "/nota <question> asks using your Obsidian vault (restricted)\n"
     "/resumo summarizes the latest diary notes (restricted)\n"
     "/lembrete <10m> <texto> creates a reminder (restricted)\n"
@@ -403,6 +415,97 @@ def history_keyboard():
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("Limpar historico", callback_data="history:reset")]]
     )
+
+
+def topic_keyboard():
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Outro tópico", callback_data="estudo:random")]]
+    )
+
+
+def list_topics(root=None):
+    base = Path(root or ESTUDOS_PATH)
+    if not base.is_dir():
+        return []
+    topics = []
+    for path in sorted(base.rglob("*.md")):
+        if path.is_symlink():
+            continue
+        relative = path.relative_to(base)
+        if any(part.startswith(".") for part in relative.parts):
+            continue
+        topics.append(relative)
+    return topics
+
+
+def topic_title(relative, text):
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            title = stripped.lstrip("#").strip()
+            if title:
+                return title
+    return relative.stem.replace("_", " ").replace("-", " ")
+
+
+def load_topic(relative, root=None, limit=None):
+    path = Path(root or ESTUDOS_PATH) / relative
+    text = path.read_text(encoding="utf-8", errors="ignore")
+    return text[: (limit or TOPIC_LIMIT)]
+
+
+def topic_title_for(relative):
+    try:
+        return topic_title(relative, load_topic(relative, limit=2000))
+    except OSError:
+        return relative.stem
+
+
+async def run_topic_summary(placeholder, user_id):
+    if not check_rate_limit(user_id):
+        await safe_edit(
+            placeholder,
+            f"Rate limit: max {RATE_LIMIT_PER_MINUTE} perguntas por minuto. Tente em instantes.",
+        )
+        return
+    topics = list_topics()
+    if not topics:
+        await safe_edit(
+            placeholder,
+            "Nenhum material de estudos encontrado. Monte o corpus em "
+            "~/Projetos/estudos (ESTUDOS_PATH) e reinicie o bot.",
+        )
+        return
+    relative = random.choice(topics)
+    try:
+        text = load_topic(relative)
+    except OSError:
+        await safe_edit(placeholder, "Não consegui ler o material de estudos agora.")
+        return
+    title = topic_title(relative, text)
+    messages = [
+        {"role": "system", "content": TOPIC_SYSTEM_PROMPT},
+        {"role": "user", "content": f"{TOPIC_QUESTION}\n\n[Arquivo: {relative}]\n{text}"},
+    ]
+    parts = []
+    last_edit = 0.0
+    try:
+        async for chunk in stream_chat(messages, OLLAMA_URL):
+            parts.append(chunk)
+            if time.monotonic() - last_edit >= EDIT_INTERVAL:
+                last_edit = time.monotonic()
+                await safe_edit(placeholder, f"Tópico: {title}\n\n" + "".join(parts))
+    except (httpx.HTTPError, ValueError, KeyError):
+        answer = "".join(parts).strip()
+        await safe_edit(
+            placeholder, answer or "Não consegui montar o resumo agora. Tente de novo."
+        )
+        return
+    answer = "".join(parts).strip()
+    if not answer:
+        await safe_edit(placeholder, "Não consegui montar o resumo agora. Tente de novo.")
+        return
+    await safe_edit(placeholder, f"Tópico: {title}\n\n{answer}", reply_markup=topic_keyboard())
 
 
 def normalize_cep(value):
@@ -715,15 +818,41 @@ async def estudo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await require_allowed(update):
         return
     question = " ".join(context.args or []).strip()
-    if not question:
-        await update.message.reply_text("Usage: /estudo <question>")
+    if question:
+        await answer_with_llm(
+            update,
+            question,
+            ESTUDOS_PROXY_URL,
+            "Could not reach the study tutor right now. Try again later.",
+        )
         return
-    await answer_with_llm(
-        update,
-        question,
-        ESTUDOS_PROXY_URL,
-        "Could not reach the study tutor right now. Try again later.",
-    )
+    placeholder = await update.message.reply_text("Sorteando um tópico...")
+    await run_topic_summary(placeholder, get_user_id(update))
+
+
+async def estudo_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not is_allowed(update):
+        await query.answer("Acesso restrito.", show_alert=True)
+        return
+    await query.answer()
+    await safe_edit(query.message, "Sorteando outro tópico...")
+    await run_topic_summary(query.message, query.from_user.id)
+
+
+async def topicos(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await require_allowed(update):
+        return
+    topics = list_topics()
+    if not topics:
+        await update.message.reply_text(
+            "Nenhum material de estudos encontrado em ESTUDOS_PATH."
+        )
+        return
+    lines = [f"- {topic_title_for(topic)}" for topic in topics]
+    text = "Tópicos disponíveis:\n" + "\n".join(lines)
+    text += "\n\nUse /estudo <pergunta> para perguntar ou /estudo sem argumento para sortear."
+    await update.message.reply_text(truncate(text))
 
 
 async def resumo(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -840,6 +969,7 @@ def build_application(token):
     application.add_handler(CommandHandler("ask", ask))
     application.add_handler(CommandHandler("nota", nota))
     application.add_handler(CommandHandler("estudo", estudo))
+    application.add_handler(CommandHandler("topicos", topicos))
     application.add_handler(CommandHandler("resumo", resumo))
     application.add_handler(CommandHandler("lembrete", lembrete))
     application.add_handler(CommandHandler("status", status))
@@ -854,6 +984,9 @@ def build_application(token):
     application.add_handler(CallbackQueryHandler(coin_callback, pattern=r"^coin:"))
     application.add_handler(
         CallbackQueryHandler(history_callback, pattern=r"^history:reset$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(estudo_callback, pattern=r"^estudo:random$")
     )
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     application.add_error_handler(error)

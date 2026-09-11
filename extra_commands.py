@@ -18,7 +18,9 @@ Tudo que usa IA, suas notas, voz ou tarefas exige acesso liberado
 
 IA local (restrito)
 /ask explique listas em Python — conversar com a IA
-/estudo o que é modelagem dimensional? — consultar o tutor de estudos
+/estudo o que é modelagem dimensional? — perguntar ao tutor
+/estudo sem argumento — sortear um tópico com resumo e botão "Outro tópico"
+/topicos — listar os tópicos de estudos
 /traduzir inglês Bom dia — traduzir um texto
 Envie uma mensagem de voz — receber a transcrição (até 2 minutos)
 /reset — apagar seu histórico e resumo da conversa

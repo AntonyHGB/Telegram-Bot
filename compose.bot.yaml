@@ -6,3 +6,6 @@ services:
       NOTION_DATA_SOURCE_ID: ${NOTION_DATA_SOURCE_ID:-}
       WHISPER_MODEL: ${WHISPER_MODEL:-base}
       WHISPER_CACHE: /data/whisper
+      ESTUDOS_PATH: /estudos
+    volumes:
+      - /home/antonio/Projetos/estudos:/estudos:ro

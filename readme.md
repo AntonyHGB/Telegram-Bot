@@ -46,6 +46,7 @@ Variáveis reconhecidas:
 | `OLLAMA_MODEL` | `qwen2.5:3b` | modelo usado em `/ask`, `/nota` e `/traduzir` |
 | `VAULT_PROXY_URL` | `http://127.0.0.1:11435` | proxy do vault para `/nota` e `/resumo` |
 | `ESTUDOS_PROXY_URL` | `http://127.0.0.1:11436` | proxy do tutor de estudos para `/estudo` |
+| `ESTUDOS_PATH` | `/estudos` | pasta local do corpus, montada somente leitura no Docker |
 | `BOT_DB_PATH` | `bot_history.db` | banco SQLite do histórico e lembretes |
 | `RATE_LIMIT_PER_MINUTE` | `5` | limite de perguntas/minuto na IA, `/tarefa` e voz |
 | `NOTION_TOKEN` | vazio | credencial da integração interna do Notion |
@@ -80,7 +81,9 @@ Se `TELEGRAM_BOT_TOKEN` não estiver definido, o programa encerra com uma mensag
 | `/ask <pergunta>` | IA local com streaming e contexto (restrito) |
 | `/traduzir <idioma> <texto>` | Tradução pela IA local, ex.: `/traduzir inglês Bom dia` (restrito) |
 | `/nota <pergunta>` | Responde usando as notas do vault Obsidian (restrito) |
-| `/estudo <pergunta>` | Responde usando o material de estudos (restrito) |
+| `/estudo <pergunta>` | Pergunta ao tutor sobre o material de estudos (restrito) |
+| `/estudo` | Sorteia um tópico do corpus e devolve um resumo, com botão "Outro tópico" (restrito) |
+| `/topicos` | Lista os tópicos de estudos disponíveis (restrito) |
 | `/resumo` | Resume as notas de diário mais recentes do vault (restrito) |
 | `/lembrete 10m texto` | Agenda um lembrete (`s`/`m`/`h`/`d`), persistido em SQLite (restrito) |
 | `/tarefa <titulo>` | Cria uma página no Notion configurado (restrito) |
@@ -113,11 +116,13 @@ as mais antigas são resumidas pelo próprio modelo e substituídas por um resum
 `/reset` apaga tudo. Cada resposta traz um botão "Limpar historico".
 
 `/nota` e `/resumo` chamam `{VAULT_PROXY_URL}/api/chat`, que injeta trechos do vault e
-devolve a lista de notas consultadas. `/estudo` usa o mesmo caminho em
-`{ESTUDOS_PROXY_URL}/api/chat` sobre o corpus de estudos. **Todos são restritos** por
-`ALLOWED_USER_IDS` (fail-closed), assim como `/ask`, `/status` e `/lembrete`; o corpus
-de estudos não é exposto a usuários não autorizados. As perguntas de IA têm limite de
-`RATE_LIMIT_PER_MINUTE` por usuário para proteger a GPU local.
+devolve a lista de notas consultadas. `/estudo <pergunta>` usa o mesmo caminho em
+`{ESTUDOS_PROXY_URL}/api/chat` sobre o corpus de estudos, enquanto `/estudo` **sem
+argumento** sorteia um `.md` do corpus (`ESTUDOS_PATH`), resume o conteúdo com o Ollama
+local e mostra o botão "Outro tópico"; `/topicos` lista os títulos disponíveis. **Todos
+são restritos** por `ALLOWED_USER_IDS` (fail-closed), assim como `/ask`, `/status` e
+`/lembrete`. As perguntas de IA têm limite de `RATE_LIMIT_PER_MINUTE` por usuário para
+proteger a GPU local.
 
 `/lembrete` usa o `JobQueue` do PTB e uma tabela `reminders` no SQLite: lembretes
 pendentes são reagendados automaticamente quando o bot reinicia.
@@ -162,8 +167,10 @@ docker compose logs -f telegram-bot
 
 Na rede da stack o bot usa `OLLAMA_URL=http://ollama:11434`,
 `VAULT_PROXY_URL=http://vault-proxy:11434` e
-`ESTUDOS_PROXY_URL=http://estudos-proxy:11434`; o banco e o cache de voz ficam no volume
-`bot_data`. A imagem já inclui o `faster-whisper` via `requirements-audio.txt`.
+`ESTUDOS_PROXY_URL=http://estudos-proxy:11434`; o corpus de `~/Projetos/estudos` é
+montado somente leitura em `/estudos` (`ESTUDOS_PATH`) para os resumos sorteados. O banco
+e o cache de voz ficam no volume `bot_data`. A imagem já inclui o `faster-whisper` via
+`requirements-audio.txt`.
 
 Se a ai-stack não for editada, o arquivo `compose.bot.yaml` deste repositório adiciona
 as variáveis de Notion/voz por merge:
@@ -182,10 +189,10 @@ pytest
 ruff check .
 ```
 
-Os testes (66) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
+Os testes (71) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
 histórico SQLite, sumarização, lembretes, autorização, rate limit, echo em grupo,
-transcrição de voz (com mock), criação de tarefa no Notion (com `httpx.MockTransport`)
-e o registro dos handlers, sem rede nem token real.
+seleção de tópicos de estudo, transcrição de voz (com mock), criação de tarefa no Notion
+(com `httpx.MockTransport`) e o registro dos handlers, sem rede nem token real.
 
 ## Estrutura
 
@@ -219,3 +226,5 @@ Em 2026-09-11 (fase 3) ganhou `/estudo`, o tutor de estudos servido pelo `estudo
 da ai-stack, e o acesso ficou **fail-closed**: todos os comandos de IA/dados
 (`/ask`, `/estudo`, `/nota`, `/resumo`, `/status`, `/lembrete`, voz e `/tarefa`) exigem
 `ALLOWED_USER_IDS`, e o prompt do modelo não finge conhecer a configuração do bot.
+Em 2026-09-11 (fase 4) ganhou `/estudo` sem argumento sorteando um tópico com resumo e
+botão "Outro tópico", além de `/topicos` para listar o corpus local.

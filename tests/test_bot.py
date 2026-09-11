@@ -50,6 +50,7 @@ class FakeCallbackQuery:
     def __init__(self, data, user_id=42):
         self.data = data
         self.from_user = FakeUser(user_id)
+        self.message = FakeMessage()
         self.answers = []
         self.edits = []
         self.markup_edits = []
@@ -555,10 +556,63 @@ def test_nota_uses_vault_proxy(history, monkeypatch):
     assert "vault" in update.message.texts[-1]
 
 
-def test_estudo_without_question_returns_usage(history):
+def test_estudo_without_question_sorts_topic(tmp_path, monkeypatch):
+    (tmp_path / "modelagem.md").write_text("# Modelagem dimensional\ntexto", encoding="utf-8")
+    monkeypatch.setattr(bot, "ESTUDOS_PATH", str(tmp_path))
+    captured = {}
+    monkeypatch.setattr(bot, "stream_chat", fake_stream(["Star schema..."], captured))
     update, context = FakeUpdate(), FakeContext()
     run(bot.estudo(update, context))
-    assert "Usage" in update.message.texts[0]
+    assert captured["messages"][-1]["content"].startswith(bot.TOPIC_QUESTION)
+    assert "Modelagem dimensional" in update.message.texts[-1]
+    assert "Star schema" in update.message.texts[-1]
+    assert update.message.markups[-1] is not None
+
+
+def test_estudo_without_corpus_returns_message(monkeypatch):
+    monkeypatch.setattr(bot, "ESTUDOS_PATH", "/caminho/inexistente")
+    update = FakeUpdate()
+    run(bot.estudo(update, FakeContext()))
+    assert "Nenhum material" in update.message.texts[-1]
+
+
+def test_estudo_callback_sorts_another(tmp_path, monkeypatch):
+    (tmp_path / "alfa.md").write_text("# Alfa\nx", encoding="utf-8")
+    monkeypatch.setattr(bot, "ESTUDOS_PATH", str(tmp_path))
+    monkeypatch.setattr(bot, "stream_chat", fake_stream(["resumo novo"]))
+    query = FakeCallbackQuery("estudo:random")
+    update = FakeUpdate()
+    update.callback_query = query
+    run(bot.estudo_callback(update, FakeContext()))
+    assert "Alfa" in query.message.texts[-1]
+    assert "resumo novo" in query.message.texts[-1]
+
+
+def test_list_topics_and_title(tmp_path):
+    (tmp_path / "a.md").write_text("# Titulo A\nconteudo", encoding="utf-8")
+    (tmp_path / ".hidden").mkdir()
+    (tmp_path / ".hidden" / "b.md").write_text("# B", encoding="utf-8")
+    (tmp_path / "nota.txt").write_text("x", encoding="utf-8")
+    topics = bot.list_topics(str(tmp_path))
+    assert [topic.name for topic in topics] == ["a.md"]
+    assert bot.topic_title(topics[0], "# Titulo A\nconteudo") == "Titulo A"
+
+
+def test_topicos_lists_titles(tmp_path, monkeypatch):
+    (tmp_path / "a.md").write_text("# Alfa\nx", encoding="utf-8")
+    (tmp_path / "b.md").write_text("# Beta\ny", encoding="utf-8")
+    monkeypatch.setattr(bot, "ESTUDOS_PATH", str(tmp_path))
+    update = FakeUpdate()
+    run(bot.topicos(update, FakeContext()))
+    assert "- Alfa" in update.message.texts[-1]
+    assert "- Beta" in update.message.texts[-1]
+
+
+def test_topicos_requires_allowed_user(monkeypatch):
+    monkeypatch.setattr(bot, "ALLOWED_USER_IDS", set())
+    update = FakeUpdate()
+    run(bot.topicos(update, FakeContext()))
+    assert "restrito" in update.message.texts[0].lower()
 
 
 def test_estudo_requires_allowed_user(history, monkeypatch):
