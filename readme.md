@@ -53,6 +53,15 @@ Variáveis reconhecidas:
 | `DEALS_WINDOW_HOURS` | `24` | janela de tempo do `/ofertas` |
 | `DEALS_TOP` | `5` | quantas ofertas o `/ofertas` mostra |
 | `DEALS_ALERT_PERCENT` | `50` | desconto mínimo (%) para receber alerta em DM; `0` desliga |
+| `DEALS_JEV_RANKING` | vazio (auto) | liga/desliga o piloto de ranking com Jev; vazio liga se houver `JEV_API_KEY`, `0` força desligado |
+| `JEV_API_KEY` | vazio | API key do OpenCode Console para o Jev; sem ela o piloto não roda |
+| `JEV_MODEL` | `jev-1.13-free` | modelo do Jev usado no ranking |
+| `JEV_TIMEOUT` | `8` | timeout (s) da chamada ao Jev; em falha o `/ofertas` segue normal |
+| `DEALS_HISTORY_RETENTION_DAYS` | `90` | retenção do histórico de preços (dias) |
+| `DEALS_HISTORY_DEDUPE_HOURS` | `6` | janela de dedupe de observações iguais (horas) |
+| `DEALS_HISTORY_MIN_SAMPLE` | `5` | amostra mínima de observações para haver veredito |
+| `DEALS_HISTORY_WINDOWS_DAYS` | `7,30,90` | janelas (dias) comparadas com a mediana/mínimo |
+| `DEALS_HISTORY_CHEAP_PCT` | `20` | % mínimo abaixo da mediana para considerar barato |
 | `NOTION_TOKEN` | vazio | credencial da integração interna do Notion |
 | `NOTION_DATA_SOURCE_ID` | vazio | data source onde `/tarefa` cria páginas |
 | `WHISPER_MODEL` | `base` | tamanho do modelo Whisper (`tiny`/`base`/`small`...) |
@@ -171,6 +180,98 @@ Alertas: quando o desconto é maior ou igual a `DEALS_ALERT_PERCENT` (padrão 50
 manda uma DM para cada ID em `ALLOWED_USER_IDS`. Duplicatas com o mesmo link são
 ignoradas por 6 horas. `/ofertas` é restrito e só funciona na conversa privada.
 
+### Ranking com Jev (piloto, opt-in)
+
+O `/ofertas` pode reordenar as ofertas pelo score do **Jev** (System One da TypeSafe,
+via `https://opencode.ai/zen/v1/systemone`) em vez de só pelo desconto. O piloto é
+**opt-in**: basta definir `JEV_API_KEY` (a `DEALS_JEV_RANKING` vazia liga; use `0` para
+forçar desligado). Modelo (`JEV_MODEL`, padrão `jev-1.13-free`) e timeout (`JEV_TIMEOUT`)
+são configuráveis.
+
+- **O que sai da máquina** (por oferta, já parseada pelo regex local): título genérico
+  do produto (sem URL, @menção, e-mail, telefone, convite, cupom, preço ou % off), preço,
+  preço antigo, desconto e loja. **Nunca** saem nomes/IDs de usuário, grupo/chat, links,
+  mensagens brutas, cupons ou histórico.
+- **Fail-closed no título**: se após a limpeza sobrar padrão de dado pessoal (CPF/CNPJ,
+  telefone, e-mail, @menção, convite) ou texto livre suspeito, o título é omitido (vira
+  "produto"). Se nenhum candidato tiver título seguro, a chamada é pulada.
+- **Fallback**: sem chave, erro HTTP/timeout, score com confiança baixa ou resposta
+  inválida, o `/ofertas` mantém a ordem atual por desconto e nunca falha. O cabeçalho
+  mostra "por score do Jev" só quando o ranking realmente foi aplicado; no fallback
+  continua "por desconto".
+- **Custo**: uma única chamada por `/ofertas`, no máximo 10 candidatos.
+- **Desligar**: defina `DEALS_JEV_RANKING=0` (ou remova `JEV_API_KEY`) e reinicie o bot.
+
+⚠️ A sanitização remove os dados sensíveis conhecidos, mas o título deriva do texto da
+mensagem; mensagens de promoção com dados pessoais embutidos podem, em tese, deixar
+fragmentos. Mantenha o piloto desligado se isso for inaceitável para os grupos monitorados.
+
+## Histórico de preços (quando a oferta é realmente barata)
+
+Além do desconto anunciado, o bot guarda um histórico de preços por produto e usa-o para
+dizer se o preço atual está realmente baixo. O histórico fica na tabela
+`price_observations` do mesmo SQLite (`bot_data`), criada de forma **aditiva e
+idempotente** (`CREATE TABLE/INDEX IF NOT EXISTS`): não altera `deals`, `reminders` nem
+`history`. Um rollback de imagem/código **não** exige mexer no banco: a versão anterior
+simplesmente ignora a tabela extra e o histórico é preservado (só um `DROP TABLE
+price_observations` manual e destrutivo o apagaria).
+
+- **Identidade conservadora**: loja + título normalizado (+ URL canônica, sem parâmetros
+  de tracking). Cupom, contato, preço e texto de promoção não entram na chave. Títulos
+  vagos (categoria pura, sem modelo/medida) **não** ganham histórico, para não agregar
+  produtos diferentes.
+- **Só grava o confiável**: oferta precisa de loja, título específico e preço válido.
+- **Comparação robusta**: preço atual vs. mediana/mínimo de janelas anteriores
+  (`DEALS_HISTORY_WINDOWS_DAYS`), exigindo `DEALS_HISTORY_MIN_SAMPLE` observações
+  anteriores. A observação atual nunca entra no próprio baseline (evita contaminação).
+  Só é "realmente barato" se todas as janelas com amostra suficiente concordarem.
+- **Rótulos explícitos**: "novo mínimo em Nd (N obs)", "X% abaixo da mediana de Nd
+  (N obs)", "dentro do normal de Nd (N obs)" ou **"sem histórico suficiente"**. A janela
+  exibida é a **mais curta com amostra suficiente** (a mais recente), então não se alega
+  "90d" quando só há algumas horas de dados; o número de observações aparece no rótulo.
+  Antes de haver amostra mínima o bot não afirma que a oferta é boa.
+- **Preço listado ≠ preço final**: só o preço listado (o único confiável do regex) entra no
+  baseline; frete e desconto de cupom **não** são incorporados. O `old_price` anunciado
+  nunca é usado como referência (pode ser fictício).
+- **Crescimento controlado**: dedupe de repetições na mesma janela
+  (`DEALS_HISTORY_DEDUPE_HOURS`) e retenção (`DEALS_HISTORY_RETENTION_DAYS`), com índices
+  por identidade/tempo e `WAL` + `busy_timeout` para concorrência.
+- **Sem degradar o `/ofertas`**: a ordenação continua sendo por desconto (ou pelo Jev,
+  quando ligado). O histórico só acrescenta uma linha informativa por oferta; falhas do
+  histórico são silenciosas e nunca quebram a captura nem o comando.
+
+Limitações conhecidas: não distingue variantes/tamanhos que compartilhem loja e título;
+não incorpora frete/cupom; o histórico é **ponderado pelo tempo**, então um produto
+repetidamente anunciado no mesmo preço pesa mais na mediana (a dedupe de 6h limita
+repetições imediatas, não ao longo de dias); pode haver falsos positivos quando o preço
+muda de patamar (queda estrutural) ou falsos "sem histórico" quando o título varia entre
+reposts; o histórico é privado e fica no mesmo banco local das demais tabelas.
+
+### Backup e restauração (SQLite)
+
+Com `WAL` ativo, copiar só o `.db` (`cp`) pode perder ou corromper dados que estão no
+`-wal`. Use a **API de backup do SQLite**, que produz uma cópia consistente:
+
+```bash
+# cópia consistente para dentro do volume (execute no host, via container)
+docker compose --profile bot exec -T telegram-bot python - <<'PY'
+import os
+from datetime import datetime
+from price_history import PriceHistory
+os.makedirs("/data/backups", exist_ok=True)
+stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+PriceHistory("/data/bot_history.db").backup(f"/data/backups/bot_history-{stamp}.db")
+print("backup ok")
+PY
+```
+
+- O método `PriceHistory.backup()` usa `sqlite3.Connection.backup` e é seguro com WAL
+  ativo e escrita concorrente.
+- Restauração: pare o bot, substitua `/data/bot_history.db` pelo arquivo de backup e
+  suba de novo. **Valide a restauração apenas em banco sintético** antes de qualquer
+  procedimento real — nunca sobrescreva o banco de produção às cegas.
+
+
 ## Notion (`/tarefa`)
 
 A integração é independente do MCP do Notion usado pelo OpenCode: o bot fala direto com
@@ -221,9 +322,12 @@ pytest
 ruff check .
 ```
 
-Os testes (89) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
+Os testes (152) cobrem as funções puras de formatação, validação de CEP/moedas/clima,
 histórico SQLite, sumarização, lembretes, autorização, rate limit, echo em grupo,
-seleção de tópicos de estudo, parsing/ranking de ofertas, transcrição de voz (com mock),
+seleção de tópicos de estudo, parsing/ranking de ofertas (incluindo o piloto com Jev via
+`httpx.MockTransport`), histórico de preços (schema/migração aditiva, identidade e
+colisões, dedupe, janelas/amostra mínima, rótulos, retenção, rollback de código, backup e
+restauração via API do SQLite e integração com o bot), transcrição de voz (com mock),
 criação de tarefa no Notion (com `httpx.MockTransport`) e o registro dos handlers, sem
 rede nem token real.
 
@@ -234,6 +338,8 @@ rede nem token real.
 ├── bot_tele_parrot.py     # handlers, histórico SQLite, integrações HTTP e entrypoint
 ├── extra_commands.py      # /guia, /meuid, /traduzir, /tarefa e transcrição de voz
 ├── deals.py               # parsing, score e storage das ofertas dos grupos
+├── jev.py                 # piloto de ranking de ofertas com Jev (opt-in)
+├── price_history.py       # histórico de preços e detecção de oferta realmente barata
 ├── integrations.py        # faster-whisper + cliente independente do Notion
 ├── Dockerfile             # imagem usada pelo serviço telegram-bot da ai-stack
 ├── compose.bot.yaml       # override opcional do compose da ai-stack
@@ -245,7 +351,9 @@ rede nem token real.
 └── tests/
     ├── test_bot.py
     ├── test_deals.py
-    └── test_extras.py
+    ├── test_extras.py
+    ├── test_jev.py
+    └── test_price_history.py
 ```
 
 ## Histórico
@@ -265,3 +373,5 @@ Em 2026-09-11 (fase 4) ganhou `/estudo` sem argumento sorteando um tópico com r
 botão "Outro tópico", além de `/topicos` para listar o corpus local.
 Em 2026-09-11 (fase 5) ganhou captura de ofertas dos grupos (`/ofertas`, alertas por
 desconto e resumo com IA), ativada ao desativar o privacy mode no BotFather.
+Em 2026-09-23 ganhou o piloto opt-in de ranking de ofertas com Jev (System One da
+TypeSafe), com sanitização dos campos enviados e fallback para a ordem por desconto.

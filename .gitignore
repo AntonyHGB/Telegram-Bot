@@ -5,3 +5,9 @@ __pycache__/
 *.db
 .pytest_cache/
 .ruff_cache/
+# allowlist privada do importador offline (nunca versionar ids de chat)
+.telegram_import_allowlist.json
+# sessões/segredos do coletor MTProto (nunca versionar)
+*.session
+*.session-journal
+.telegram_collector.env

@@ -1,0 +1,5 @@
+# Dependências do coletor MTProto (user API).
+# NÃO instalado automaticamente. Quando for usar:
+#   python -m venv .venv && .venv/bin/pip install -r requirements-collector.txt
+# Telethon é a lib conhecida escolhida para o user API.
+Telethon>=1.36,<2

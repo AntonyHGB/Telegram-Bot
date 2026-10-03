@@ -13,6 +13,8 @@ from urllib.parse import quote
 import httpx
 from deals import DealStore, deals_summary_prompt, format_deal, format_deal_alert, parse_deal
 from extra_commands import guia, register_extras
+from jev import jev_enabled, rank_deals
+from price_history import PriceHistory, format_history_note, history_config_from_env
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.error import InvalidToken, TelegramError
 from telegram.ext import (
@@ -62,6 +64,12 @@ TOPIC_LIMIT = 8000
 DEALS_WINDOW_HOURS = int(os.environ.get("DEALS_WINDOW_HOURS", "24"))
 DEALS_TOP = int(os.environ.get("DEALS_TOP", "5"))
 DEALS_ALERT_PERCENT = int(os.environ.get("DEALS_ALERT_PERCENT", "50"))
+JEV_API_KEY = os.environ.get("JEV_API_KEY", "").strip()
+JEV_MODEL = os.environ.get("JEV_MODEL", "jev-1.13-free")
+JEV_TIMEOUT = float(os.environ.get("JEV_TIMEOUT", "8"))
+# Opt-in: flag explicita manda; sem flag, liga quando houver JEV_API_KEY.
+DEALS_JEV_RANKING = jev_enabled(os.environ.get("DEALS_JEV_RANKING"), JEV_API_KEY)
+DEALS_HISTORY_CONFIG = history_config_from_env()
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5:3b")
 DB_PATH = os.environ.get("BOT_DB_PATH", "bot_history.db")
 RATE_LIMIT_PER_MINUTE = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "5"))
@@ -302,6 +310,7 @@ class ReminderStore:
 HISTORY = History(DB_PATH)
 REMINDERS = ReminderStore(DB_PATH)
 DEALS = DealStore(DB_PATH)
+PRICES = PriceHistory(DB_PATH, **DEALS_HISTORY_CONFIG)
 
 
 def get_user_id(update):
@@ -890,6 +899,10 @@ async def capture_deal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not DEALS.add(message.chat.id, message.message_id, deal):
         return
+    try:
+        PRICES.record(deal)
+    except Exception:  # noqa: BLE001 - histórico nunca pode quebrar a captura
+        logger.warning("Falha ao registrar o histórico de preço.", exc_info=True)
     if DEALS_ALERT_PERCENT <= 0 or not deal.get("discount"):
         return
     if deal["discount"] < DEALS_ALERT_PERCENT:
@@ -915,8 +928,27 @@ async def ofertas(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Adicione o bot aos grupos de promoções."
         )
         return
+    try:
+        for deal, evaluation in zip(deals, PRICES.evaluate_many(deals), strict=False):
+            deal["history_note"] = format_history_note(evaluation)
+    except Exception:  # noqa: BLE001 - histórico é informativo, nunca crítico
+        for deal in deals:
+            deal["history_note"] = None
+    ranked_by_jev = False
+    if DEALS_JEV_RANKING:
+        try:
+            ranked = await rank_deals(
+                deals, api_key=JEV_API_KEY, model=JEV_MODEL, timeout=JEV_TIMEOUT
+            )
+        except Exception:  # noqa: BLE001 - o piloto nunca pode quebrar o /ofertas
+            logger.warning("Jev ranking falhou; mantendo a ordem por desconto.")
+            ranked = None
+        if ranked is not None:
+            deals = ranked
+            ranked_by_jev = True
     blocks = [format_deal(deal, index) for index, deal in enumerate(deals, start=1)]
-    text = f"Melhores ofertas (últimas {DEALS_WINDOW_HOURS}h, por desconto):\n\n"
+    order = "score do Jev" if ranked_by_jev else "desconto"
+    text = f"Melhores ofertas (últimas {DEALS_WINDOW_HOURS}h, por {order}):\n\n"
     text += "\n\n".join(blocks)
     await update.message.reply_text(truncate(text), reply_markup=deals_keyboard())
 

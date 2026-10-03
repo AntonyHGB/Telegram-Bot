@@ -11,3 +11,10 @@ tests/
 readme.md
 Dockerfile
 .dockerignore
+# Sessões/allowlist/segredos do coletor MTProto (nunca no build context)
+*.db-wal
+*.db-shm
+*.session
+*.session-journal
+.telegram_import_allowlist.json
+.telegram_collector.env

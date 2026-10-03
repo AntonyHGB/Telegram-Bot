@@ -1,0 +1,15 @@
+# Imagem mínima do coletor MTProto (user API). NÃO construída automaticamente.
+# Quando autorizado:
+#   docker build -f Dockerfile.collector -t telegram-collector .
+# O coletor não precisa de httpx: a sanitização vive em text_sanitize.py.
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY requirements-collector.txt ./
+RUN pip install --no-cache-dir -r requirements-collector.txt
+
+COPY deals.py price_history.py text_sanitize.py telegram_export_import.py \
+     telegram_user_collector.py ./
+
+ENTRYPOINT ["python", "telegram_user_collector.py"]

@@ -132,6 +132,8 @@ def format_deal(deal, index=None):
         lines.append(f"Loja: {deal['store']}")
     if deal.get("coupon"):
         lines.append(f"Cupom: {deal['coupon']}")
+    if deal.get("history_note"):
+        lines.append(deal["history_note"])
     snippet = deal.get("text", "").strip()
     if len(snippet) > 220:
         snippet = snippet[:217] + "..."
@@ -177,33 +179,44 @@ class DealStore:
     def _connect(self):
         return sqlite3.connect(self.path)
 
-    def add(self, chat_id, message_id, deal, created_at=None):
+    def add(self, chat_id, message_id, deal, created_at=None, connection=None):
+        """Grava a oferta. `connection` opcional permite transação do chamador.
+
+        Sem `connection`, abre e fecha a própria conexão (comportamento original).
+        Com `connection`, não faz commit: quem chamou controla a transação.
+        """
         created_at = created_at if created_at is not None else time.time()
-        with closing(self._connect()) as connection, connection:
-            if deal.get("link"):
-                duplicate = connection.execute(
-                    "SELECT 1 FROM deals WHERE link = ? AND created_at > ?",
-                    (deal["link"], created_at - 6 * 3600),
-                ).fetchone()
-                if duplicate:
-                    return False
-            cursor = connection.execute(
-                "INSERT OR IGNORE INTO deals (chat_id, message_id, created_at, text, price,"
-                " old_price, discount, coupon, store, link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    chat_id,
-                    message_id,
-                    created_at,
-                    deal["text"],
-                    deal.get("price"),
-                    deal.get("old_price"),
-                    deal.get("discount"),
-                    deal.get("coupon"),
-                    deal.get("store"),
-                    deal.get("link"),
-                ),
-            )
-            return cursor.rowcount > 0
+        if connection is not None:
+            return self._add_with(connection, chat_id, message_id, deal, created_at)
+        with closing(self._connect()) as conn, conn:
+            return self._add_with(conn, chat_id, message_id, deal, created_at)
+
+    @staticmethod
+    def _add_with(connection, chat_id, message_id, deal, created_at):
+        if deal.get("link"):
+            duplicate = connection.execute(
+                "SELECT 1 FROM deals WHERE link = ? AND created_at > ?",
+                (deal["link"], created_at - 6 * 3600),
+            ).fetchone()
+            if duplicate:
+                return False
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO deals (chat_id, message_id, created_at, text, price,"
+            " old_price, discount, coupon, store, link) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                chat_id,
+                message_id,
+                created_at,
+                deal["text"],
+                deal.get("price"),
+                deal.get("old_price"),
+                deal.get("discount"),
+                deal.get("coupon"),
+                deal.get("store"),
+                deal.get("link"),
+            ),
+        )
+        return cursor.rowcount > 0
 
     def top(self, limit=5, hours=24, term=None):
         since = time.time() - hours * 3600

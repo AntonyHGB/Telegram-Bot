@@ -175,3 +175,64 @@ def test_format_deal_with_coupon_and_old_price():
     assert "R$ 200,00 (de R$ 400,00)" in text
     assert "Cupom: X10" in text
     assert "https://x.test" in text
+
+
+def test_ofertas_applies_jev_ranking(deals, monkeypatch):
+    monkeypatch.setattr(bot, "DEALS_JEV_RANKING", True)
+    deals.add(1, 1, sample_deal(text="desconto grande", discount=90.0))
+    deals.add(1, 2, sample_deal(text="desconto pequeno", discount=10.0))
+    calls = []
+
+    async def fake_rank(items, **kwargs):
+        calls.append(kwargs)
+        return list(reversed(items))
+
+    monkeypatch.setattr(bot, "rank_deals", fake_rank)
+    update = FakeUpdate()
+    run(bot.ofertas(update, FakeContext()))
+    text = update.message.texts[-1]
+    assert text.index("desconto pequeno") < text.index("desconto grande")
+    assert "por score do Jev" in text
+    assert calls
+
+
+def test_ofertas_falls_back_when_ranking_unavailable(deals, monkeypatch):
+    monkeypatch.setattr(bot, "DEALS_JEV_RANKING", True)
+    deals.add(1, 1, sample_deal(text="desconto grande", discount=90.0))
+    deals.add(1, 2, sample_deal(text="desconto pequeno", discount=10.0))
+
+    async def fake_rank(items, **kwargs):
+        return None
+
+    monkeypatch.setattr(bot, "rank_deals", fake_rank)
+    update = FakeUpdate()
+    run(bot.ofertas(update, FakeContext()))
+    text = update.message.texts[-1]
+    assert text.index("desconto grande") < text.index("desconto pequeno")
+    assert "por desconto" in text
+
+
+def test_ofertas_survives_ranking_error(deals, monkeypatch):
+    monkeypatch.setattr(bot, "DEALS_JEV_RANKING", True)
+    deals.add(1, 1, sample_deal())
+
+    async def fake_rank(items, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(bot, "rank_deals", fake_rank)
+    update = FakeUpdate()
+    run(bot.ofertas(update, FakeContext()))
+    assert "50,0% off" in update.message.texts[-1]
+
+
+def test_ofertas_skips_ranking_when_disabled(deals, monkeypatch):
+    monkeypatch.setattr(bot, "DEALS_JEV_RANKING", False)
+    deals.add(1, 1, sample_deal())
+
+    async def fake_rank(items, **kwargs):
+        raise AssertionError("ranking nao deveria rodar")
+
+    monkeypatch.setattr(bot, "rank_deals", fake_rank)
+    update = FakeUpdate()
+    run(bot.ofertas(update, FakeContext()))
+    assert "50,0% off" in update.message.texts[-1]
